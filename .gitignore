@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+.venv/
+venv/
+*.egg
+
+# Node / Frontend
+node_modules/
+frontend/dist/
+*.tsbuildinfo
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project
+.forge/
+forge.db
+*.db-journal
+*.db-wal
+
+# Build
+build/
+dist/
+release/
+
+# Office temp files
+~$*.docx
+~$*.xlsx
+~$*.pptx
