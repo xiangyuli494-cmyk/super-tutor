@@ -19,11 +19,11 @@ class RoleManager:
 
     Usage::
 
-        mgr = RoleManager(prompts_dir="forge-engine/prompts")
+        mgr = RoleManager(prompts_dir="super_tutor/prompts")
         system_prompt = mgr.build_context(
-            role="codex",
-            project_path="/home/user/projects/demo",
-            extra_context={"current_module": "m2-llm-client", "token_budget": "12000"},
+            role="assistant",
+            project_path="/home/user/sessions/demo",
+            extra_context={"phase": "quiz_gen", "chunk_count": "12"},
         )
     """
 
@@ -34,9 +34,9 @@ class RoleManager:
             prompts_dir: Path to the directory containing role ``.md``
                 template files.  Expected layout::
 
-                    {prompts_dir}/claude-a.md
-                    {prompts_dir}/codex.md
-                    {prompts_dir}/claude-b.md
+                    {prompts_dir}/tutor.md
+                    {prompts_dir}/assistant.md
+                    {prompts_dir}/evaluator.md
         """
         self._prompts_dir = Path(prompts_dir)
         self._cache: dict[str, str] = {}
@@ -52,7 +52,7 @@ class RoleManager:
         subsequent calls for the same role do not touch disk.
 
         Args:
-            role: One of ``"claude-a"``, ``"codex"``, ``"claude-b"``.
+            role: One of ``"tutor"``, ``"assistant"``, ``"evaluator"``.
 
         Returns:
             The raw markdown template content.
@@ -97,7 +97,7 @@ class RoleManager:
 
         Args:
             role: Target role identifier.
-            project_path: Root path of the active Forge project directory.
+            project_path: Root path of the active Super Tutor session directory.
             extra_context: Optional key-value pairs describing the current
                 execution environment (e.g. ``{"current_module": "m2-llm-client",
                 "token_budget_remaining": "15000"}``).

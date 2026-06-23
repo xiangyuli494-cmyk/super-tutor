@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from super_tutor.core.database import Database
+from super_tutor.core.exceptions import VALID_ROLES
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +70,8 @@ class TokenTracker:
 
         Args:
             project_id: The project that incurred the cost.
-            role: AI role that made the call (``"claude-a"``, ``"codex"``,
-                ``"claude-b"``).
+            role: AI role that made the call (``"tutor"``, ``"assistant"``,
+                ``"evaluator"``).
             task_id: Workflow task identifier for traceability.
             model_tier: Computation tier used (``"heavy"``, ``"medium"``,
                 ``"light"``).
@@ -125,13 +126,10 @@ class TokenTracker:
         db_stats = await self._database.get_token_stats(project_id)
         used: int = db_stats.get("total_tokens", 0)  # type: ignore[assignment]
 
-        # Per-role breakdown from the database (authoritative).
+        # Per-role breakdown from the database (authoritative),
+        # dynamically derived from VALID_ROLES — no hardcoded role names.
         db_by_role: dict[str, int] = db_stats.get("by_role", {})
-        by_role = {
-            "claude-a": db_by_role.get("claude-a", 0),
-            "codex": db_by_role.get("codex", 0),
-            "claude-b": db_by_role.get("claude-b", 0),
-        }
+        by_role = {role: db_by_role.get(role, 0) for role in sorted(VALID_ROLES)}
 
         # Per-tier breakdown from in-memory counters (the database does not
         # yet expose a tier-aggregation query).

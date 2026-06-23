@@ -10,36 +10,28 @@ from super_tutor.models.enums import AgentRole
 # 有效角色标识符（单一数据源：从 AgentRole 枚举派生）
 #
 # 设计原则：任何模块需要校验角色时都引用这个常量，不手写角色名列表。
-# 过渡期通过 | 运算保留 Forge 旧角色名，orchestrator 重构后删除。
 # ---------------------------------------------------------------------------
-VALID_ROLES: frozenset[str] = (
-    frozenset(role.value for role in AgentRole)
-    | {"claude-a", "codex", "claude-b"}  # TODO: orchestrator 重构后移除
-)
+VALID_ROLES: frozenset[str] = frozenset(role.value for role in AgentRole)
 
 
-class ForgeError(Exception):
-    """Base exception for all Forge Engine errors.
+class TutorError(Exception):
+    """Super Tutor Agent 所有自定义异常的基类。
 
-    All custom exceptions raised within the Forge Engine should inherit
-    from this class, enabling callers to catch ``ForgeError`` as a
-    blanket handler for engine-specific failures.
+    项目内所有自定义异常都应继承自本类，
+    使调用方能通过 ``except TutorError`` 捕获所有项目级错误。
     """
 
 
-class LLMClientError(ForgeError):
-    """Errors originating from the LLM client layer.
+class LLMClientError(TutorError):
+    """LLM 客户端层错误。
 
-    Raised when an LLM API call fails after exhausting retries, returns
-    empty content, or encounters a transport-level issue that cannot be
-    recovered from.
+    在 API 调用重试耗尽、返回空内容或传输层故障时抛出。
     """
 
 
-class ConfigurationError(ForgeError):
-    """Configuration-related errors.
+class ConfigurationError(TutorError):
+    """配置相关错误。
 
-    Raised for invalid settings, unrecognised tier/role identifiers,
-    missing required files, malformed configuration values, or
-    path-security violations.
+    在设置无效、角色/算力档位无法识别、必要文件缺失、
+    配置值格式错误或路径安全违规时抛出。
     """

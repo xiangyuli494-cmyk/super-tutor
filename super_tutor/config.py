@@ -9,16 +9,16 @@ from pathlib import Path
 from typing import Optional
 
 
-class ForgeConfig:  # kept for backward compat with LLMClient / Database
-    """Singleton config manager.
+class TutorConfig:
+    """Super Tutor Agent 单例配置管理器。
 
     Attributes:
-        deepseek_api_key: API key for DeepSeek.
-        deepseek_base_url: Base URL for DeepSeek API.
-        token_budget_default: Default token budget.
+        deepseek_api_key: DeepSeek API 密钥。
+        deepseek_base_url: DeepSeek API 基础 URL。
+        token_budget_default: 默认 Token 预算。
     """
 
-    _instance: Optional["ForgeConfig"] = None
+    _instance: Optional["TutorConfig"] = None
 
     def __init__(self) -> None:
         self.deepseek_api_key: str = ""
@@ -29,7 +29,7 @@ class ForgeConfig:  # kept for backward compat with LLMClient / Database
         self._apply_env_overrides()
 
     @classmethod
-    def get_instance(cls) -> "ForgeConfig":
+    def get_instance(cls) -> "TutorConfig":
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance

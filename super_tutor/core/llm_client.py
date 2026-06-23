@@ -7,7 +7,7 @@ from typing import Any
 
 from openai import AsyncOpenAI
 
-from super_tutor.config import ForgeConfig
+from super_tutor.config import TutorConfig
 from super_tutor.core.exceptions import ConfigurationError, LLMClientError, VALID_ROLES
 
 logger = logging.getLogger(__name__)
@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 #
 # All tiers default to "deepseek-chat" and are differentiated by max_tokens
 # and temperature rather than different model names.  Users may override
-# the model per tier via ForgeConfig attributes (model_heavy / model_medium /
+# the model per tier via TutorConfig attributes (model_heavy / model_medium /
 # model_light).
 # ---------------------------------------------------------------------------
 _TIER_PARAMS: dict[str, dict[str, Any]] = {
@@ -55,18 +55,18 @@ class LLMClient:
 
     def __init__(
         self,
-        config: ForgeConfig,
+        config: TutorConfig,
         project_root: str | None = None,
         cli_mode: bool = False,
     ) -> None:
         """Initialize the client from project configuration.
 
         Args:
-            config: ForgeConfig instance providing ``api_key`` and
+            config: TutorConfig instance providing ``api_key`` and
                 ``api_base_url``.  Optional per-tier model overrides may
                 be supplied as ``model_heavy``, ``model_medium``,
                 ``model_light``.
-            project_root: Root directory of the active Forge project.
+            project_root: Root directory of the active Super Tutor session.
                 When set, ``_read_file`` will only allow reading files
                 inside this subtree, enforcing a path sandbox.  If
                 ``None``, file-context methods will raise
@@ -105,8 +105,8 @@ class LLMClient:
         """Send a chat-completion request and return the response text.
 
         Args:
-            role: Logical role name (``"claude-a"``, ``"codex"``,
-                ``"claude-b"``).  Validated against the canonical role
+            role: Logical role name (``"tutor"``, ``"assistant"``,
+                ``"evaluator"``).  Validated against the canonical role
                 set; used for logging and, when *messages* already
                 contain a system prompt, as a routing label.
             messages: List of message dicts with ``"role"`` and
@@ -264,7 +264,7 @@ class LLMClient:
     def _resolve_tier(self, tier: str) -> dict[str, Any]:
         """Return the ``(model, max_tokens, temperature)`` dict for *tier*.
 
-        User-configured model overrides on ``ForgeConfig`` (attributes
+        User-configured model overrides on ``TutorConfig`` (attributes
         ``model_heavy``, ``model_medium``, ``model_light``) take
         precedence over the built-in defaults.
 
@@ -277,7 +277,7 @@ class LLMClient:
             )
         params = dict(_TIER_PARAMS[tier])
 
-        # Allow ForgeConfig to override the model per tier.
+        # Allow TutorConfig to override the model per tier.
         override_attr = f"model_{tier}"
         if hasattr(self._config, override_attr):
             override_value = getattr(self._config, override_attr)

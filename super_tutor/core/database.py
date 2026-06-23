@@ -1,4 +1,4 @@
-"""SQLite + sqlite-vec persistence layer for the Forge Engine.
+"""SQLite + sqlite-vec persistence layer for Super Tutor Agent.
 
 Provides structured artifact storage, vector-based semantic search, token-usage
 tracking, and Git commit logging.  Uses aiosqlite for async I/O and attempts to
@@ -17,7 +17,7 @@ import uuid
 
 import aiosqlite
 
-from super_tutor.config import ForgeConfig
+from super_tutor.config import TutorConfig
 
 logger = logging.getLogger(__name__)
 
@@ -59,9 +59,9 @@ _DEFAULT_EMBEDDING_DIM = 1536
 
 
 class Database:
-    """Async SQLite database manager for a single Forge project.
+    """Async SQLite database manager for a Super Tutor teaching session.
 
-    Each Forge project owns one ``forge.db`` file managed through this class.
+    Each session owns one ``super_tutor.db`` file managed through this class.
     The database contains five tables:
 
     * **projects** – project-scoped metadata.
@@ -76,7 +76,7 @@ class Database:
 
     Attributes:
         db_path: Absolute path to the SQLite database file.
-        config: ForgeConfig instance providing API keys and defaults.
+        config: TutorConfig instance providing API keys and defaults.
         vec_available: ``True`` when sqlite-vec was loaded and the virtual
             table was created successfully.
         embedding_dim: Dimension of the embedding vectors (inferred from the
@@ -196,15 +196,15 @@ class Database:
     def __init__(
         self,
         db_path: str,
-        config: Optional[ForgeConfig] = None,
+        config: Optional[TutorConfig] = None,
         projects_root: Optional[str] = None,
     ) -> None:
         """Initialise the Database manager.
 
         Args:
             db_path: Path to the SQLite database file (e.g.
-                ``/home/user/forge-projects/my_project/forge.db``).
-            config: ForgeConfig instance.  When *None* the singleton is used.
+                ``/home/user/super-tutor/sessions/my_session/super_tutor.db``).
+            config: TutorConfig instance.  When *None* the singleton is used.
             projects_root: Optional project root directory to scope *db_path*
                 within.  When provided the resolved *db_path* must reside
                 inside this root.
@@ -214,8 +214,8 @@ class Database:
                 directory does not exist.
         """
         self.db_path: str = self._validate_db_path(db_path, projects_root)
-        self.config: ForgeConfig = (
-            config if config is not None else ForgeConfig.get_instance()
+        self.config: TutorConfig = (
+            config if config is not None else TutorConfig.get_instance()
         )
 
         self.vec_available: bool = False

@@ -13,15 +13,20 @@
 
 from __future__ import annotations
 
+import json as _json
 import logging
+import re as _re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from super_tutor.core.database import Database
-from super_tutor.core.exceptions import ForgeError, LLMClientError, VALID_ROLES
+from super_tutor.core.exceptions import LLMClientError, TutorError, VALID_ROLES
 from super_tutor.core.llm_client import LLMClient
 from super_tutor.core.role_manager import RoleManager
 from super_tutor.models.enums import AgentRole, WorkflowState
+from super_tutor.models.knowledge import KnowledgeChunk
+from super_tutor.models.mastery import ReviewItem
+from super_tutor.models.quiz import MisconceptionTag, Question, QuizAttempt
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +56,7 @@ _ROLE_TO_PROMPT_FILE: dict[AgentRole, str] = {
 # ---------------------------------------------------------------------------
 
 
-class OrchestratorError(ForgeError):
+class OrchestratorError(TutorError):
     """Orchestrator 层错误。"""
 
 
@@ -74,10 +79,21 @@ class Orchestrator:
 
         orch = Orchestrator(database=db, llm_client=llm, role_manager=rm)
         await orch.initialize(session_context={"material_id": "xxx"})
-        await orch.start()          # IDLE → PARSING → QUIZ_GEN
+
+        # Phase 1: PDF 解析
+        await orch.start()          # IDLE → PARSING
+        await orch.proceed()        # PARSING → QUIZ_GEN
+
+        # 学生作答（断点：等待真实学生提交）
+        await orch.submit_answers([
+            {"question_id": "q1", "student_answer": "B"},
+        ])
+
+        # Phase 2-4: 批改 → 排期 → 完成
         await orch.proceed()        # QUIZ_GEN → EVALUATING
         await orch.proceed()        # EVALUATING → PLANNING
         await orch.proceed()        # PLANNING → DONE
+
         status = await orch.get_status()
 
     Attributes:
@@ -185,6 +201,78 @@ class Orchestrator:
 
         self._transition_to(WorkflowState.PARSING)
         await self._parsing_phase()
+
+    async def submit_answers(
+        self,
+        answers: list[dict[str, Any]],
+        *,
+        quiz_session_id: Optional[str] = None,
+    ) -> int:
+        """提交学生作答，作为 EVALUATING 阶段的输入。
+
+        必须在 QUIZ_GEN 阶段完成之后调用。该方法将作答数据存入
+        会话上下文供 ``_evaluating_phase`` 消费，并同时创建
+        ``QuizAttempt`` Pydantic 模型实例用于后续持久化。
+
+        Args:
+            answers: 学生作答列表，每项可包含：
+                - ``question_id``: 题目 ID（必填）
+                - ``student_answer``: 学生提交的答案（必填）
+                - ``time_spent_seconds``: 本题耗时（可选，默认 0）
+                - ``hints_used``: 查看提示次数（可选，默认 0）
+                - ``attempt_number``: 第几次尝试（可选，默认 1）
+                - ``confidence``: 自评置信度 0-1（可选）
+            quiz_session_id: 关联的 QuizSession ID（可选）。
+
+        Returns:
+            成功提交的作答条数。
+
+        Raises:
+            OrchestratorError: 若当前状态不允许提交作答。
+        """
+        if self._state != WorkflowState.QUIZ_GEN:
+            raise OrchestratorError(
+                f"无法在 '{self._state.value}' 状态下提交作答，"
+                f"请先完成 QUIZ_GEN 阶段（当前需要 '{WorkflowState.QUIZ_GEN.value}'）。"
+            )
+
+        # 存入上下文供 _evaluating_phase 使用
+        self._session_context["student_answers"] = answers
+        self._session_context["quiz_session_id"] = quiz_session_id
+
+        # 反序列化为 Pydantic 模型（P1：模型脱节修复）
+        questions_index: dict[str, dict[str, Any]] = {}
+        for q in self._artifacts.get("questions", []):
+            qid = q.get("question_id", "")
+            if qid:
+                questions_index[qid] = q
+
+        attempts: list[QuizAttempt] = []
+        for i, ans in enumerate(answers):
+            qid = ans.get("question_id", f"unknown_{i}")
+            try:
+                attempt = QuizAttempt(
+                    session_id=quiz_session_id or self.session_id or "unknown",
+                    question_id=qid,
+                    student_answer=ans.get("student_answer"),
+                    time_spent_seconds=ans.get("time_spent_seconds", 0),
+                    hints_used=ans.get("hints_used", 0),
+                    attempt_number=ans.get("attempt_number", 1),
+                    confidence=ans.get("confidence"),
+                )
+                attempts.append(attempt)
+            except Exception as exc:
+                logger.warning(
+                    "QuizAttempt 构造失败 (question_id=%s): %s", qid, exc
+                )
+
+        self._artifacts["submitted_attempts"] = attempts
+        logger.info(
+            "提交 %d 条学生作答（%d 条成功反序列化为 QuizAttempt）。",
+            len(answers),
+            len(attempts),
+        )
+        return len(attempts)
 
     async def proceed(self) -> None:
         """推进流水线一步。
@@ -338,8 +426,14 @@ class Orchestrator:
             )
 
             # 防御解析：从 LLM 响应中提取 chunks 列表
-            chunks = _safe_parse_json_list(response, "chunks")
-            self._artifacts["chunks"] = chunks
+            chunks_raw = _safe_parse_json_list(response, "chunks")
+            chunks = _hydrate_models(
+                chunks_raw,
+                KnowledgeChunk,
+                defaults={"material_id": material_id},
+            )
+            self._artifacts["chunks"] = chunks_raw       # 保留原始 dict 供 LLM prompt
+            self._artifacts["chunk_models"] = chunks      # Pydantic 模型供内部消费
             self._artifacts["parsing_output"] = response
 
             await self._on_step_complete(
@@ -392,8 +486,18 @@ class Orchestrator:
                 tier=_QUIZ_GEN_MODEL_TIER,
             )
 
-            questions = _safe_parse_json_list(response, "questions")
-            self._artifacts["questions"] = questions
+            questions_raw = _safe_parse_json_list(response, "questions")
+            # 关联 chunk_ids 作为默认字段注入
+            chunk_id_list = [
+                c.get("chunk_id", "") for c in self._artifacts.get("chunks", [])
+            ]
+            questions = _hydrate_models(
+                questions_raw,
+                Question,
+                defaults={"chunk_ids": chunk_id_list} if chunk_id_list else None,
+            )
+            self._artifacts["questions"] = questions_raw     # 保留原始 dict 供 LLM prompt
+            self._artifacts["question_models"] = questions    # Pydantic 模型供内部消费
             self._artifacts["quiz_gen_output"] = response
 
             await self._on_step_complete(
@@ -447,10 +551,23 @@ class Orchestrator:
                 tier=_EVALUATING_MODEL_TIER,
             )
 
-            attempts = _safe_parse_json_list(response, "attempts")
-            misconceptions = _safe_parse_json_list(response, "misconceptions")
-            self._artifacts["attempts"] = attempts
-            self._artifacts["misconceptions"] = misconceptions
+            attempts_raw = _safe_parse_json_list(response, "attempts")
+            misconceptions_raw = _safe_parse_json_list(response, "misconceptions")
+
+            session_id = self.session_id or "unknown"
+            attempts = _hydrate_models(
+                attempts_raw,
+                QuizAttempt,
+                defaults={"session_id": session_id},
+            )
+            misconceptions = _hydrate_models(
+                misconceptions_raw,
+                MisconceptionTag,
+            )
+            self._artifacts["attempts"] = attempts_raw
+            self._artifacts["misconceptions"] = misconceptions_raw
+            self._artifacts["attempt_models"] = attempts
+            self._artifacts["misconception_models"] = misconceptions
             self._artifacts["evaluating_output"] = response
 
             await self._on_step_complete(
@@ -512,8 +629,18 @@ class Orchestrator:
                 tier=_PLANNING_MODEL_TIER,
             )
 
-            plan_items = _safe_parse_json_list(response, "plan_items")
-            self._artifacts["plan_items"] = plan_items
+            plan_items_raw = _safe_parse_json_list(response, "plan_items")
+            plan_items = _hydrate_models(
+                plan_items_raw,
+                ReviewItem,
+                defaults={
+                    "mastery_record_id": self._session_context.get(
+                        "student_id", ""
+                    ),
+                },
+            )
+            self._artifacts["plan_items"] = plan_items_raw
+            self._artifacts["plan_item_models"] = plan_items
             self._artifacts["planning_output"] = response
 
             await self._on_step_complete(
@@ -800,8 +927,6 @@ def _build_planning_prompt(
 # 通用辅助函数
 # ======================================================================
 
-import json as _json
-
 
 def _safe_parse_json_list(
     response: str, key: str
@@ -833,9 +958,7 @@ def _safe_parse_json_list(
         pass
 
     # 第 2 层：提取 ```json ... ``` 围栏代码块
-    import re
-
-    fence_match = re.search(
+    fence_match = _re.search(
         r"```(?:json)?\s*\n?([\s\S]*?)\n?```", response
     )
     if fence_match:
@@ -850,7 +973,7 @@ def _safe_parse_json_list(
             pass
 
     # 第 3 层：查找第一个 JSON 对象或数组
-    json_match = re.search(r"(\[.*\]|\{.*\})", response, re.DOTALL)
+    json_match = _re.search(r"(\[.*\]|\{.*\})", response, _re.DOTALL)
     if json_match:
         try:
             data = _json.loads(json_match.group(1))
@@ -870,6 +993,49 @@ def _safe_parse_json_list(
         response[:200],
     )
     return []
+
+
+def _hydrate_models(
+    raw_items: list[dict[str, Any]],
+    model_cls: type,
+    *,
+    defaults: Optional[dict[str, Any]] = None,
+) -> list[Any]:
+    """将 LLM 输出的原始字典列表反序列化为 Pydantic 模型实例。
+
+    逐条尝试 ``model_cls(**defaults, **item)``，验证失败的条目
+    记录警告后跳过，确保单个脏数据不影响整批产出物。
+
+    Args:
+        raw_items: LLM 输出的原始字典列表。
+        model_cls: 目标 Pydantic 模型类（如 ``KnowledgeChunk``）。
+        defaults: 注入到每条记录的默认字段值
+                  （如 ``material_id``、``session_id`` 等运行时上下文）。
+
+    Returns:
+        成功反序列化的模型实例列表（可能短于输入）。
+    """
+    models: list[Any] = []
+    merged_defaults = defaults or {}
+    for i, item in enumerate(raw_items):
+        try:
+            merged = {**merged_defaults, **item}
+            models.append(model_cls(**merged))
+        except Exception as exc:
+            logger.warning(
+                "_hydrate_models: 第 %d 条 %s 反序列化失败: %s",
+                i,
+                model_cls.__name__,
+                exc,
+            )
+    if models:
+        logger.debug(
+            "_hydrate_models: %d/%d 条成功反序列化为 %s。",
+            len(models),
+            len(raw_items),
+            model_cls.__name__,
+        )
+    return models
 
 
 def _safe_truncate_json(

@@ -93,15 +93,15 @@ class WorkflowState(str, Enum):
 
     .. note::
 
-        以下状态为 Forge 遗留，仅供 orchestrator 过渡期兼容，
-        后续重构后删除：
+        以下状态为旧版遗留，保留以兼容历史数据，
+        新代码请使用上述 Super Tutor 状态：
 
-        * **CODING**      — Forge 编码阶段 → 等同于 PARSING + QUIZ_GEN
-        * **AUDITING**    — Forge 审计阶段 → 等同于 EVALUATING
-        * **ACCEPTING**   — Forge 验收阶段 → 等同于 PLANNING
+        * **CODING**      — 旧版编码阶段 → 等同于 PARSING + QUIZ_GEN
+        * **AUDITING**    — 旧版审计阶段 → 等同于 EVALUATING
+        * **ACCEPTING**   — 旧版验收阶段 → 等同于 PLANNING
     """
 
-    # -- Super Tutor 新状态 --------------------------------------------------
+    # -- Super Tutor 状态 ----------------------------------------------------
     IDLE = "idle"
     PARSING = "parsing"
     QUIZ_GEN = "quiz_gen"
@@ -111,7 +111,7 @@ class WorkflowState(str, Enum):
     PAUSED = "paused"
     ERROR = "error"
 
-    # -- Forge 遗留状态（过渡期兼容，重构 orchestrator 后删除）---------------
+    # -- 旧版遗留状态（保留以兼容历史数据）-----------------------------------
     CODING = "coding"
     AUDITING = "auditing"
     ACCEPTING = "accepting"
