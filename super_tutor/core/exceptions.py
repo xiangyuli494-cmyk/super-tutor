@@ -1,14 +1,21 @@
-"""Forge Engine custom exception hierarchy.
+"""Super Tutor Agent — 自定义异常体系。
 
-Defines a project-level exception tree so callers can catch fine-grained
-error types instead of relying on built-in exceptions.
+定义项目级异常树，让调用方能捕获细粒度错误类型，
+避免依赖内置异常做控制流。
 """
 
+from super_tutor.models.enums import AgentRole
+
 # ---------------------------------------------------------------------------
-# Shared constant — valid role identifiers used by both LLMClient and
-# RoleManager for input validation.
+# 有效角色标识符（单一数据源：从 AgentRole 枚举派生）
+#
+# 设计原则：任何模块需要校验角色时都引用这个常量，不手写角色名列表。
+# 过渡期通过 | 运算保留 Forge 旧角色名，orchestrator 重构后删除。
 # ---------------------------------------------------------------------------
-VALID_ROLES: frozenset[str] = frozenset({"claude-a", "codex", "claude-b"})
+VALID_ROLES: frozenset[str] = (
+    frozenset(role.value for role in AgentRole)
+    | {"claude-a", "codex", "claude-b"}  # TODO: orchestrator 重构后移除
+)
 
 
 class ForgeError(Exception):

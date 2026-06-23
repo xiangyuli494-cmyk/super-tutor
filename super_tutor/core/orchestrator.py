@@ -1,48 +1,58 @@
-"""Workflow orchestrator — the heart of the Forge AI collaboration engine.
+"""Workflow orchestrator — Super Tutor Agent 教学流水线引擎。
 
-Implements a state-machine-driven pipeline that coordinates three AI roles
-(Claude-A, Codex, Claude-B) through a structured software development
-workflow: planning → coding → auditing → accepting.
+实现状态机驱动的 Multi-Agent 协作流水线：
+
+    IDLE → PARSING → QUIZ_GEN → EVALUATING → PLANNING → DONE
+
+三个 AI 角色各司其职：
+
+* **Tutor**（主导师）— 解析 PDF 资料 + 制定学习计划
+* **Assistant**（助教）— 根据知识库生成题目 + 组卷
+* **Evaluator**（评估者）— 批改作答 + 迷思概念诊断
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import re
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Optional
 
-from super_tutor.models import WorkflowState
 from super_tutor.core.database import Database
 from super_tutor.core.exceptions import ForgeError, LLMClientError, VALID_ROLES
-from super_tutor.core.filesystem import FileSystem
 from super_tutor.core.llm_client import LLMClient
 from super_tutor.core.role_manager import RoleManager
+from super_tutor.models.enums import AgentRole, WorkflowState
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Constants
+# 常量
 # ---------------------------------------------------------------------------
 
 _MAX_STEP_RETRIES: int = 3
-"""Maximum number of consecutive retry attempts before staying in ERROR."""
+"""单步最大连续重试次数，超过后停留 ERROR 等待人工介入。"""
 
-_PLANNING_MODEL_TIER: str = "heavy"
-_CODING_MODEL_TIER: str = "heavy"
-_AUDITING_MODEL_TIER: str = "medium"
-_ACCEPTING_MODEL_TIER: str = "medium"
+# 各阶段使用的 LLM 算力档位
+_PARSING_MODEL_TIER: str = "heavy"       # PDF 解析需要强理解能力
+_QUIZ_GEN_MODEL_TIER: str = "heavy"      # 出题需要高质量输出
+_EVALUATING_MODEL_TIER: str = "medium"    # 批改中等算力即可
+_PLANNING_MODEL_TIER: str = "medium"      # 排期计算中等算力即可
+
+# AgentRole → RoleManager 文件名 的映射
+_ROLE_TO_PROMPT_FILE: dict[AgentRole, str] = {
+    AgentRole.TUTOR: "tutor",
+    AgentRole.ASSISTANT: "assistant",
+    AgentRole.EVALUATOR: "evaluator",
+}
 
 
 # ---------------------------------------------------------------------------
-# Custom exception
+# 自定义异常
 # ---------------------------------------------------------------------------
 
 
 class OrchestratorError(ForgeError):
-    """Errors originating from the Orchestrator layer."""
+    """Orchestrator 层错误。"""
 
 
 # ---------------------------------------------------------------------------
@@ -51,94 +61,73 @@ class OrchestratorError(ForgeError):
 
 
 class Orchestrator:
-    """State-machine-driven workflow orchestrator for Forge projects.
+    """教学流水线状态机编排器。
 
-    Coordinates the three AI roles through a structured pipeline:
+    协调三个 AI Agent 按序推进：
 
-    1. **Planning** – Claude-A produces requirements, constitution, API spec,
-       and task board.
-    2. **Coding** – Codex implements each module listed in the task board,
-       writing code into the sandbox zone.
-    3. **Auditing** – Claude-B reviews the sandbox output against the
-       constitution; rejects non-compliant work.
-    4. **Accepting** – Claude-A performs final acceptance; either approves
-       the module or sends it back to coding.
+    1. **PARSING** — Tutor 解析 PDF，生成知识片段和摘要。
+    2. **QUIZ_GEN** — Assistant 基于知识库生成测验题目。
+    3. **EVALUATING** — Evaluator 批改学生作答，诊断迷思概念。
+    4. **PLANNING** — Tutor 综合掌握数据，生成 SM-2 排期计划。
 
-    Modules are processed one at a time: coding → auditing → accepting forms
-    a per-module loop that repeats until every module on the task board
-    passes acceptance.
+    使用方式::
+
+        orch = Orchestrator(database=db, llm_client=llm, role_manager=rm)
+        await orch.initialize(session_context={"material_id": "xxx"})
+        await orch.start()          # IDLE → PARSING → QUIZ_GEN
+        await orch.proceed()        # QUIZ_GEN → EVALUATING
+        await orch.proceed()        # EVALUATING → PLANNING
+        await orch.proceed()        # PLANNING → DONE
+        status = await orch.get_status()
 
     Attributes:
-        project_id: Unique project identifier.
-        project_root: Absolute path to the project root directory.
-        state: Current workflow state (read-only property).
+        state: 当前工作流状态（只读属性）。
+        session_id: 当前教学会话标识。
     """
 
     def __init__(
         self,
-        project_root: str,
+        database: Database,
         llm_client: LLMClient,
         role_manager: RoleManager,
-        filesystem: FileSystem,
-        database: Database,
-        project_id: str | None = None,
     ) -> None:
-        """Initialise the orchestrator.
+        """初始化编排器。
 
         Args:
-            project_root: Absolute path to the Forge project root.
-            llm_client: Configured LLM client for API calls.
-            role_manager: Role system-prompt manager.
-            filesystem: Permission-aware filesystem manager.
-            database: Project database (must already be initialised via
-                ``Database.initialize()``).
-            project_id: Optional project UUID.  When *None* the project-root
-                directory name is used as a fallback identifier.
+            database: 数据库管理器（必须已调用 ``initialize()``）。
+            llm_client: 已配置的 LLM 客户端。
+            role_manager: Agent 系统提示词管理器。
         """
-        self._project_root: Path = Path(project_root).resolve()
-        self._project_id: str = project_id or self._project_root.name
+        self._db: Database = database
         self._llm: LLMClient = llm_client
         self._roles: RoleManager = role_manager
-        self._fs: FileSystem = filesystem
-        self._db: Database = database
 
         # ------------------------------------------------------------------
-        # State machine
+        # 会话上下文 — 贯穿整个流水线的运行时数据
+        # ------------------------------------------------------------------
+        self._session_context: dict[str, Any] = {}
+
+        # ------------------------------------------------------------------
+        # 状态机
         # ------------------------------------------------------------------
         self._state: WorkflowState = WorkflowState.IDLE
         self._previous_state: WorkflowState = WorkflowState.IDLE
         self._error_message: Optional[str] = None
-
-        # ------------------------------------------------------------------
-        # Module iteration
-        # ------------------------------------------------------------------
-        self._modules: list[dict[str, Any]] = []
-        self._module_index: int = 0
-        self._current_module: Optional[str] = None
-
-        # ------------------------------------------------------------------
-        # Phase results — govern state transitions in ``proceed()``.
-        # ------------------------------------------------------------------
-        self._audit_passed: bool = False
-        self._acceptance_passed: bool = False
-
-        # ------------------------------------------------------------------
-        # Retry tracking
-        # ------------------------------------------------------------------
         self._step_retry_count: int = 0
 
         # ------------------------------------------------------------------
-        # Per-role status tracking
+        # 阶段产出物 — 上游阶段写入，下游阶段读取
+        # ------------------------------------------------------------------
+        self._artifacts: dict[str, Any] = {}
+
+        # ------------------------------------------------------------------
+        # Agent 状态追踪
         # ------------------------------------------------------------------
         self._role_statuses: dict[str, str] = {
-            "claude-a": "idle",
-            "codex": "idle",
-            "claude-b": "idle",
+            role.value: "idle" for role in AgentRole
         }
         self._role_tasks: dict[str, Optional[str]] = {
-            "claude-a": None,
-            "codex": None,
-            "claude-b": None,
+            role.value: None for role in AgentRole
         }
 
     # ==================================================================
@@ -147,56 +136,73 @@ class Orchestrator:
 
     @property
     def state(self) -> WorkflowState:
-        """Return the current workflow state."""
+        """返回当前工作流状态。"""
         return self._state
 
     @property
-    def project_id(self) -> str:
-        """Return the project identifier."""
-        return self._project_id
+    def session_id(self) -> Optional[str]:
+        """返回当前会话 ID。"""
+        return self._session_context.get("session_id")
 
     # ==================================================================
-    # State-machine controls (public API)
+    # 初始化
+    # ==================================================================
+
+    async def initialize(self, session_context: dict[str, Any]) -> None:
+        """设置流水线的运行时上下文。
+
+        必须在 ``start()`` 之前调用。
+
+        Args:
+            session_context: 会话上下文，至少包含：
+                - ``material_id``: 学习材料 ID
+                - ``session_id``: 可选会话标识
+                - ``student_id``: 可选学生标识
+        """
+        self._session_context = session_context
+        logger.info(
+            "Orchestrator session context set: material=%s",
+            session_context.get("material_id"),
+        )
+
+    # ==================================================================
+    # 状态机控制（公开 API）
     # ==================================================================
 
     async def start(self) -> None:
-        """Start the workflow: **IDLE → PLANNING**.
+        """启动流水线：IDLE → PARSING。
 
-        Triggers Claude-A to produce the requirements document, project
-        constitution, API specification, and task board.  On success the
-        state settles at ``PLANNING``; the caller should then invoke
-        ``proceed()`` to advance through the remaining phases.
+        由 Parser Agent（Tutor 角色）解析 PDF 材料，生成知识片段。
 
         Raises:
-            OrchestratorError: If called from a state other than ``IDLE``.
+            OrchestratorError: 若不是从 IDLE 状态调用。
         """
         if self._state != WorkflowState.IDLE:
             raise OrchestratorError(
-                f"Cannot start from state '{self._state.value}'. "
-                f"Expected '{WorkflowState.IDLE.value}'."
+                f"无法从 '{self._state.value}' 启动，"
+                f"需要 '{WorkflowState.IDLE.value}' 状态。"
             )
 
-        self._transition_to(WorkflowState.PLANNING)
-        await self._planning_phase()
+        self._transition_to(WorkflowState.PARSING)
+        await self._parsing_phase()
 
     async def proceed(self) -> None:
-        """Advance the workflow by one step.
+        """推进流水线一步。
 
-        Reads the current state, determines the next transition, and
-        executes the corresponding phase.  Module-level rejections (audit
-        or acceptance failure) route back to ``CODING`` for the same
-        module so Codex can apply fixes.
+        根据当前状态自动判断下一步并执行对应阶段。
 
         Raises:
-            OrchestratorError: If called from ``IDLE``, ``PAUSED``, ``ERROR``,
-                or ``DONE`` — use ``start()`` first, or ``resume()`` /
-                ``retry_step()`` instead.
+            OrchestratorError: 若从 IDLE / PAUSED / ERROR / DONE 调用。
         """
-        if self._state in (WorkflowState.IDLE, WorkflowState.PAUSED,
-                            WorkflowState.ERROR, WorkflowState.DONE):
+        if self._state in (
+            WorkflowState.IDLE,
+            WorkflowState.PAUSED,
+            WorkflowState.ERROR,
+            WorkflowState.DONE,
+        ):
             raise OrchestratorError(
-                f"Cannot proceed from state '{self._state.value}'. "
-                f"Use start() first, or resume()/retry_step() instead."
+                f"无法从 '{self._state.value}' 推进，"
+                f"请先调用 start() / resume() / retry_step()。"
             )
 
         next_state = self._compute_next_state()
@@ -204,71 +210,65 @@ class Orchestrator:
         await self._execute_phase(next_state)
 
     async def pause(self) -> None:
-        """Pause the workflow from any active state.
+        """暂停流水线。
 
-        Saves the current state so ``resume()`` can restore it later.
-        Calling ``pause()`` while already paused is a no-op.
+        保存当前状态以便 ``resume()`` 恢复。已暂停时调用为幂等操作。
 
         Raises:
-            OrchestratorError: If called from a terminal state (``DONE``
-                or ``ERROR``).
+            OrchestratorError: 若从 DONE / ERROR 等终态调用。
         """
         if self._state == WorkflowState.PAUSED:
-            return  # Already paused — idempotent.
+            return
         if self._state in (WorkflowState.DONE, WorkflowState.ERROR):
             raise OrchestratorError(
-                f"Cannot pause from terminal state '{self._state.value}'."
+                f"无法从终态 '{self._state.value}' 暂停。"
             )
 
         self._previous_state = self._state
         self._transition_to(WorkflowState.PAUSED)
-        logger.info("Workflow paused (was %s).", self._previous_state.value)
+        logger.info("流水线已暂停（原状态: %s）。", self._previous_state.value)
 
     async def resume(self) -> None:
-        """Resume the workflow from ``PAUSED`` back to the previous state.
+        """从 PAUSED 恢复到之前的状态。
 
         Raises:
-            OrchestratorError: If not currently ``PAUSED``.
+            OrchestratorError: 若当前不是 PAUSED 状态。
         """
         if self._state != WorkflowState.PAUSED:
             raise OrchestratorError(
-                f"Cannot resume from state '{self._state.value}'. "
-                f"Expected '{WorkflowState.PAUSED.value}'."
+                f"无法从 '{self._state.value}' 恢复，"
+                f"需要 '{WorkflowState.PAUSED.value}' 状态。"
             )
 
         self._transition_to(self._previous_state)
-        logger.info("Workflow resumed to %s.", self._state.value)
+        logger.info("流水线已恢复到 %s。", self._state.value)
 
     async def retry_step(self) -> None:
-        """Retry the current step after an error.
+        """重试当前失败步骤。
 
-        Resets error state and re-executes the phase that failed.  Limited
-        to ``_MAX_STEP_RETRIES`` consecutive retries; exceeding this limit
-        leaves the orchestrator in ``ERROR`` to avoid infinite loops.
+        限制连续重试 ``_MAX_STEP_RETRIES`` 次，超过后保持 ERROR。
 
         Raises:
-            OrchestratorError: If not currently in ``ERROR`` state.
+            OrchestratorError: 若当前不是 ERROR 状态。
         """
         if self._state != WorkflowState.ERROR:
             raise OrchestratorError(
-                f"Cannot retry from state '{self._state.value}'. "
-                f"Expected '{WorkflowState.ERROR.value}'."
+                f"无法从 '{self._state.value}' 重试，"
+                f"需要 '{WorkflowState.ERROR.value}' 状态。"
             )
 
         self._step_retry_count += 1
         if self._step_retry_count > _MAX_STEP_RETRIES:
             self._error_message = (
-                f"Step retry limit ({_MAX_STEP_RETRIES}) exceeded. "
-                f"Manual intervention required."
+                f"步骤重试已达上限（{_MAX_STEP_RETRIES} 次），请人工介入。"
             )
             logger.error(self._error_message)
-            return  # Stay in ERROR.
+            return
 
-        # Restore to the state that failed, then re-execute.
         failed_state = self._previous_state
         self._transition_to(failed_state)
         logger.info(
-            "Retrying step (attempt %d/%d) in state %s.",
+            "重试步骤（%d/%d），目标状态: %s。",
             self._step_retry_count,
             _MAX_STEP_RETRIES,
             failed_state.value,
@@ -277,405 +277,308 @@ class Orchestrator:
         await self._execute_phase(failed_state)
 
     async def get_status(self) -> dict[str, Any]:
-        """Return the current workflow status as a dictionary.
-
-        The returned dict matches the ``WorkflowStatus`` Pydantic model
-        shape and is suitable for JSON serialisation.
+        """返回当前流水线状态快照。
 
         Returns:
-            A dict with keys ``project_id``, ``state``, ``current_module``,
-            ``modules_total``, ``modules_completed``, ``modules_remaining``,
-            ``roles``, and ``error_message``.
+            包含状态、阶段产物摘要及各 Agent 状态的字典。
         """
-        modules_total = len(self._modules)
-        modules_completed = self._module_index
-        modules_remaining = max(0, modules_total - modules_completed)
-
         return {
-            "project_id": self._project_id,
             "state": self._state.value,
-            "current_module": self._current_module,
-            "modules_total": modules_total,
-            "modules_completed": modules_completed,
-            "modules_remaining": modules_remaining,
-            "roles": {
-                "claude-a": {
-                    "status": self._role_statuses.get("claude-a", "idle"),
-                    "current_task": self._role_tasks.get("claude-a"),
-                },
-                "codex": {
-                    "status": self._role_statuses.get("codex", "idle"),
-                    "current_task": self._role_tasks.get("codex"),
-                },
-                "claude-b": {
-                    "status": self._role_statuses.get("claude-b", "idle"),
-                    "current_task": self._role_tasks.get("claude-b"),
-                },
-            },
+            "session_id": self.session_id,
             "error_message": self._error_message,
+            "artifacts": {
+                "chunk_count": len(self._artifacts.get("chunks", [])),
+                "question_count": len(self._artifacts.get("questions", [])),
+                "attempt_count": len(self._artifacts.get("attempts", [])),
+                "plan_item_count": len(self._artifacts.get("plan_items", [])),
+            },
+            "roles": {
+                role.value: {
+                    "status": self._role_statuses.get(role.value, "idle"),
+                    "current_task": self._role_tasks.get(role.value),
+                }
+                for role in AgentRole
+            },
         }
 
     # ==================================================================
-    # Phase implementations
+    # 阶段实现
     # ==================================================================
 
-    async def _planning_phase(self) -> None:
-        """Claude-A produces requirements, constitution, API spec, and task board.
+    async def _parsing_phase(self) -> None:
+        """PARSING 阶段：Tutor 解析 PDF 材料。
 
-        On completion the planning artifacts are persisted to the
-        ``constitution/`` zone and the module list is parsed from the
-        generated task board.
+        输入：session_context 中的 material_id
+        产出：KnowledgeChunk 列表（摘要形式），写入 _artifacts["chunks"]
+        下一状态：QUIZ_GEN
         """
-        self._set_role_status("claude-a", "active", "生成需求文档与项目宪法")
+        role = AgentRole.TUTOR
+        self._set_role_status(role, "active", "解析 PDF 材料，生成知识片段")
+
+        material_id = self._session_context.get("material_id", "unknown")
 
         try:
-            planning_prompt = _build_planning_prompt()
+            prompt = _build_parsing_prompt(material_id)
 
             system_prompt = self._roles.build_context(
-                role="claude-a",
-                project_path=str(self._project_root),
+                role=role.value,
+                project_path="",  # 教学场景无需项目路径
                 extra_context={
-                    "phase": "planning",
-                    "action": "生成完整项目规划文档集",
+                    "phase": "parsing",
+                    "material_id": material_id,
+                    "action": "解析 PDF 内容，输出知识片段列表",
                 },
             )
 
             response = await self._invoke_role(
-                role="claude-a",
-                user_message=planning_prompt,
+                role=role.value,
+                user_message=prompt,
+                system_prompt=system_prompt,
+                tier=_PARSING_MODEL_TIER,
+            )
+
+            # 防御解析：从 LLM 响应中提取 chunks 列表
+            chunks = _safe_parse_json_list(response, "chunks")
+            self._artifacts["chunks"] = chunks
+            self._artifacts["parsing_output"] = response
+
+            await self._on_step_complete(
+                role=role.value,
+                artifact={
+                    "type": "parsing_result",
+                    "title": "PDF 解析结果",
+                    "summary_256": f"生成 {len(chunks)} 个知识片段",
+                    "full_text": response[:2000],
+                },
+            )
+
+            self._set_role_status(role, "idle", None)
+            logger.info("PARSING 阶段完成：%d 个知识片段。", len(chunks))
+
+        except Exception as exc:
+            self._set_role_status(role, "error", str(exc))
+            self._handle_phase_error(exc)
+            raise
+
+    async def _quiz_gen_phase(self) -> None:
+        """QUIZ_GEN 阶段：Assistant 基于知识库生成测验题目。
+
+        输入：_artifacts["chunks"]
+        产出：Question 列表 + QuizSession，写入 _artifacts["questions"]
+        下一状态：EVALUATING
+        """
+        role = AgentRole.ASSISTANT
+        self._set_role_status(role, "active", "基于知识库生成测验题目")
+
+        chunks = self._artifacts.get("chunks", [])
+
+        try:
+            prompt = _build_quiz_gen_prompt(chunks)
+
+            system_prompt = self._roles.build_context(
+                role=role.value,
+                project_path="",
+                extra_context={
+                    "phase": "quiz_gen",
+                    "chunk_count": str(len(chunks)),
+                    "action": "根据知识片段生成测验题目",
+                },
+            )
+
+            response = await self._invoke_role(
+                role=role.value,
+                user_message=prompt,
+                system_prompt=system_prompt,
+                tier=_QUIZ_GEN_MODEL_TIER,
+            )
+
+            questions = _safe_parse_json_list(response, "questions")
+            self._artifacts["questions"] = questions
+            self._artifacts["quiz_gen_output"] = response
+
+            await self._on_step_complete(
+                role=role.value,
+                artifact={
+                    "type": "quiz_generation",
+                    "title": "题目生成结果",
+                    "summary_256": f"生成 {len(questions)} 道题目",
+                    "full_text": response[:2000],
+                },
+            )
+
+            self._set_role_status(role, "idle", None)
+            logger.info("QUIZ_GEN 阶段完成：%d 道题目。", len(questions))
+
+        except Exception as exc:
+            self._set_role_status(role, "error", str(exc))
+            self._handle_phase_error(exc)
+            raise
+
+    async def _evaluating_phase(self) -> None:
+        """EVALUATING 阶段：Evaluator 批改学生作答。
+
+        输入：_artifacts["questions"] + 学生作答数据
+        产出：批改结果 + MisconceptionTag 列表，写入 _artifacts["attempts"]
+        下一状态：PLANNING
+        """
+        role = AgentRole.EVALUATOR
+        self._set_role_status(role, "active", "批改作答，诊断迷思概念")
+
+        questions = self._artifacts.get("questions", [])
+        student_answers = self._session_context.get("student_answers", [])
+
+        try:
+            prompt = _build_evaluating_prompt(questions, student_answers)
+
+            system_prompt = self._roles.build_context(
+                role=role.value,
+                project_path="",
+                extra_context={
+                    "phase": "evaluating",
+                    "question_count": str(len(questions)),
+                    "action": "批改学生作答并诊断迷思概念",
+                },
+            )
+
+            response = await self._invoke_role(
+                role=role.value,
+                user_message=prompt,
+                system_prompt=system_prompt,
+                tier=_EVALUATING_MODEL_TIER,
+            )
+
+            attempts = _safe_parse_json_list(response, "attempts")
+            misconceptions = _safe_parse_json_list(response, "misconceptions")
+            self._artifacts["attempts"] = attempts
+            self._artifacts["misconceptions"] = misconceptions
+            self._artifacts["evaluating_output"] = response
+
+            await self._on_step_complete(
+                role=role.value,
+                artifact={
+                    "type": "evaluation_result",
+                    "title": "批改与诊断结果",
+                    "summary_256": (
+                        f"批改 {len(attempts)} 题，"
+                        f"诊断 {len(misconceptions)} 个迷思概念"
+                    ),
+                    "full_text": response[:2000],
+                },
+            )
+
+            self._set_role_status(role, "idle", None)
+            logger.info(
+                "EVALUATING 阶段完成：%d 题已批改，%d 个迷思概念。",
+                len(attempts),
+                len(misconceptions),
+            )
+
+        except Exception as exc:
+            self._set_role_status(role, "error", str(exc))
+            self._handle_phase_error(exc)
+            raise
+
+    async def _planning_phase(self) -> None:
+        """PLANNING 阶段：Tutor 生成 SM-2 排期学习计划。
+
+        输入：_artifacts 中的批改结果 + 迷思概念
+        产出：StudyPlan（ReviewItem 列表），写入 _artifacts["plan_items"]
+        下一状态：DONE
+        """
+        role = AgentRole.TUTOR
+        self._set_role_status(role, "active", "生成 SM-2 排期学习计划")
+
+        attempts = self._artifacts.get("attempts", [])
+        misconceptions = self._artifacts.get("misconceptions", [])
+
+        try:
+            prompt = _build_planning_prompt(attempts, misconceptions)
+
+            system_prompt = self._roles.build_context(
+                role=role.value,
+                project_path="",
+                extra_context={
+                    "phase": "planning",
+                    "attempt_count": str(len(attempts)),
+                    "misconception_count": str(len(misconceptions)),
+                    "action": "综合评估数据生成 SM-2 间隔重复排期计划",
+                },
+            )
+
+            response = await self._invoke_role(
+                role=role.value,
+                user_message=prompt,
                 system_prompt=system_prompt,
                 tier=_PLANNING_MODEL_TIER,
             )
 
-            # Parse the response and write individual constitution files.
-            await self._persist_planning_artifacts(response)
-
-            # Parse modules from the generated task board.
-            self._modules = await self._parse_task_board()
-
-            # Record the planning artifact.
-            await self._on_step_complete(
-                role="claude-a",
-                artifact={
-                    "type": "constitution",
-                    "title": "项目规划文档集",
-                    "summary_256": "需求文档、项目宪法、接口规范、任务清单",
-                    "full_text": response[:2000],
-                    "file_path": "constitution/",
-                },
-            )
-
-            self._set_role_status("claude-a", "idle", None)
-            logger.info(
-                "Planning phase complete. %d modules parsed from task board.",
-                len(self._modules),
-            )
-
-        except Exception as exc:
-            self._set_role_status("claude-a", "error", str(exc))
-            self._handle_phase_error(exc)
-            raise
-
-    async def _coding_phase(self) -> None:
-        """Codex implements the current module, writing output to ``sandbox/``.
-
-        Reads the module specification from the task board, builds a
-        coding prompt augmented with constitution context, and invokes
-        Codex to produce the implementation.
-
-        When no more modules remain the phase is a no-op (all modules have
-        been accepted).
-        """
-        if not self._modules or self._module_index >= len(self._modules):
-            logger.info("No more modules to code — all modules accepted.")
-            return
-
-        module = self._modules[self._module_index]
-        self._current_module = module.get("id", f"m{self._module_index + 1}")
-        module_name = module.get("name", self._current_module)
-        module_tasks = module.get("tasks", "")
-
-        self._set_role_status("codex", "active", f"编码模块: {self._current_module}")
-
-        # Reset phase-result flags for the new (or retried) module round.
-        self._audit_passed = False
-        self._acceptance_passed = False
-
-        try:
-            coding_prompt = _build_coding_prompt(
-                module_id=self._current_module,
-                module_name=module_name,
-                module_tasks=module_tasks,
-            )
-
-            context_files = _collect_constitution_files(
-                self._project_root, "requirements.md", "api-spec.yaml", "task-board.md"
-            )
-
-            system_prompt = self._roles.build_context(
-                role="codex",
-                project_path=str(self._project_root),
-                extra_context={
-                    "phase": "coding",
-                    "current_module": self._current_module,
-                    "output_dir": f"sandbox/{self._current_module}/",
-                },
-            )
-
-            response = await self._invoke_role(
-                role="codex",
-                user_message=coding_prompt,
-                context_files=context_files,
-                system_prompt=system_prompt,
-                tier=_CODING_MODEL_TIER,
-            )
-
-            # Save Codex response as an artifact.
-            await self._on_step_complete(
-                role="codex",
-                artifact={
-                    "type": "code",
-                    "module": self._current_module,
-                    "title": f"{self._current_module}: {module_name}",
-                    "summary_256": f"模块 {self._current_module} 的代码实现",
-                    "full_text": response[:2000],
-                    "file_path": f"sandbox/{self._current_module}/",
-                },
-            )
-
-            self._set_role_status("codex", "idle", None)
-            logger.info("Coding phase complete for module %s.", self._current_module)
-
-        except Exception as exc:
-            self._set_role_status("codex", "error", str(exc))
-            self._handle_phase_error(exc)
-            raise
-
-    async def _auditing_phase(self) -> None:
-        """Claude-B audits the sandbox code produced by Codex.
-
-        Reviews code against the constitution, API spec, and code-style
-        rules.  Produces an audit report in ``test/``.  The ``_audit_passed``
-        flag is set based on the audit conclusion and governs the next state
-        transition.
-        """
-        if not self._current_module:
-            raise OrchestratorError("No current module to audit.")
-
-        self._set_role_status("claude-b", "active", f"审计模块: {self._current_module}")
-
-        try:
-            audit_prompt = _build_audit_prompt(self._current_module)
-
-            context_files = _collect_constitution_files(
-                self._project_root, "requirements.md", "api-spec.yaml"
-            )
-            context_files.extend(
-                _collect_sandbox_files(self._project_root, self._current_module)
-            )
-
-            system_prompt = self._roles.build_context(
-                role="claude-b",
-                project_path=str(self._project_root),
-                extra_context={
-                    "phase": "auditing",
-                    "current_module": self._current_module,
-                    "sandbox_path": f"sandbox/{self._current_module}/",
-                },
-            )
-
-            response = await self._invoke_role(
-                role="claude-b",
-                user_message=audit_prompt,
-                context_files=context_files,
-                system_prompt=system_prompt,
-                tier=_AUDITING_MODEL_TIER,
-            )
-
-            # Determine pass/fail and persist the audit report.
-            self._audit_passed = self._parse_audit_result(response)
-
-            audit_path = f"test/{self._current_module}-audit.md"
-            self._fs.write_file("claude-b", audit_path, response)
+            plan_items = _safe_parse_json_list(response, "plan_items")
+            self._artifacts["plan_items"] = plan_items
+            self._artifacts["planning_output"] = response
 
             await self._on_step_complete(
-                role="claude-b",
+                role=role.value,
                 artifact={
-                    "type": "audit",
-                    "module": self._current_module,
-                    "title": f"审计报告: {self._current_module}",
-                    "summary_256": (
-                        f"模块 {self._current_module} 审计"
-                        f"{'通过' if self._audit_passed else '驳回'}"
-                    ),
+                    "type": "study_plan",
+                    "title": "SM-2 排期学习计划",
+                    "summary_256": f"生成 {len(plan_items)} 个复习条目",
                     "full_text": response[:2000],
-                    "file_path": audit_path,
                 },
             )
 
-            self._set_role_status("claude-b", "idle", None)
-            logger.info(
-                "Auditing phase complete for module %s: %s.",
-                self._current_module,
-                "PASS" if self._audit_passed else "FAIL",
-            )
+            self._set_role_status(role, "idle", None)
+            logger.info("PLANNING 阶段完成：%d 个排期条目。", len(plan_items))
 
         except Exception as exc:
-            self._set_role_status("claude-b", "error", str(exc))
-            self._handle_phase_error(exc)
-            raise
-
-    async def _accepting_phase(self) -> None:
-        """Claude-A performs final acceptance of the current module.
-
-        Reviews the sandbox code and audit report, then issues an
-        acceptance verdict.  Accepted modules are migrated from ``sandbox/``
-        to ``src/`` via ``FileSystem.migrate_to_src()``.  Rejected modules
-        return to coding.
-        """
-        if not self._current_module:
-            raise OrchestratorError("No current module to accept.")
-
-        self._set_role_status("claude-a", "active", f"验收模块: {self._current_module}")
-
-        try:
-            acceptance_prompt = _build_acceptance_prompt(self._current_module)
-
-            context_files = _collect_constitution_files(
-                self._project_root, "requirements.md", "api-spec.yaml"
-            )
-            # Include the audit report if it exists.
-            audit_path = str(
-                self._project_root / "test" / f"{self._current_module}-audit.md"
-            )
-            if Path(audit_path).is_file():
-                context_files.append(audit_path)
-            context_files.extend(
-                _collect_sandbox_files(self._project_root, self._current_module)
-            )
-
-            system_prompt = self._roles.build_context(
-                role="claude-a",
-                project_path=str(self._project_root),
-                extra_context={
-                    "phase": "accepting",
-                    "current_module": self._current_module,
-                    "audit_report": audit_path,
-                },
-            )
-
-            response = await self._invoke_role(
-                role="claude-a",
-                user_message=acceptance_prompt,
-                context_files=context_files,
-                system_prompt=system_prompt,
-                tier=_ACCEPTING_MODEL_TIER,
-            )
-
-            # Determine pass/fail and persist the acceptance report.
-            self._acceptance_passed = self._parse_acceptance_result(response)
-
-            self._fs.ensure_zone("review")
-            acceptance_path = f"review/acceptance/{self._current_module}.md"
-            self._fs.write_file("claude-a", acceptance_path, response)
-
-            await self._on_step_complete(
-                role="claude-a",
-                artifact={
-                    "type": "acceptance",
-                    "module": self._current_module,
-                    "title": f"验收报告: {self._current_module}",
-                    "summary_256": (
-                        f"模块 {self._current_module} 验收"
-                        f"{'通过' if self._acceptance_passed else '驳回'}"
-                    ),
-                    "full_text": response[:2000],
-                    "file_path": acceptance_path,
-                },
-            )
-
-            # Migrate sandbox → src when acceptance passes.
-            if self._acceptance_passed:
-                try:
-                    self._fs.migrate_to_src(self._current_module)
-                    logger.info(
-                        "Module %s migrated from sandbox to src.", self._current_module
-                    )
-                except Exception as mig_exc:
-                    logger.warning(
-                        "Migration failed for module %s: %s",
-                        self._current_module,
-                        mig_exc,
-                    )
-
-            self._set_role_status("claude-a", "idle", None)
-            logger.info(
-                "Acceptance phase complete for module %s: %s.",
-                self._current_module,
-                "PASS" if self._acceptance_passed else "FAIL",
-            )
-
-        except Exception as exc:
-            self._set_role_status("claude-a", "error", str(exc))
+            self._set_role_status(role, "error", str(exc))
             self._handle_phase_error(exc)
             raise
 
     # ==================================================================
-    # _invoke_role — LLM call wrapper
+    # LLM 调用封装
     # ==================================================================
 
     async def _invoke_role(
         self,
         role: str,
         user_message: str,
-        context_files: list[str] | None = None,
-        system_prompt: str | None = None,
+        system_prompt: Optional[str] = None,
         tier: str = "medium",
     ) -> str:
-        """Invoke an AI role with the given message and optional file context.
+        """调用 AI Agent 并记录 token 用量。
 
-        Wraps ``LLMClient.chat_with_file_context`` and adds:
-
-        * Token-usage logging via ``Database.log_token_usage``.
-        * Error propagation (``LLMClientError`` is re-raised; unexpected
-          exceptions are wrapped in ``LLMClientError``).
-        * Input validation for the *role* identifier.
+        封装 ``LLMClient.chat_with_file_context``，增加角色校验、
+        token 日志和错误传播。
 
         Args:
-            role: Role identifier (``"claude-a"``, ``"codex"``, ``"claude-b"``).
-            user_message: The instruction or question for the role.
-            context_files: Optional list of absolute file paths to include
-                as context blocks in the prompt.
-            system_prompt: Optional system prompt string.  When *None* the
-                role's default system prompt is loaded via ``RoleManager``.
-            tier: Computation tier (``"heavy"``, ``"medium"``, ``"light"``).
+            role: Agent 标识（``"tutor"`` / ``"assistant"`` / ``"evaluator"``）。
+            user_message: 给 Agent 的指令或上下文。
+            system_prompt: 系统提示词。None 时由 RoleManager 自动加载。
+            tier: 算力档位（``"heavy"`` / ``"medium"`` / ``"light"``）。
 
         Returns:
-            The LLM response text.
+            Agent 的完整响应文本。
 
         Raises:
-            LLMClientError: If the API call fails after all retries, or if
-                an unexpected exception occurs during the invocation.
+            LLMClientError: API 调用失败（重试耗尽后）。
         """
         if role not in VALID_ROLES:
             raise OrchestratorError(
-                f"Unknown role '{role}'. Expected one of: {sorted(VALID_ROLES)}"
+                f"未知角色 '{role}'。有效角色: {sorted(VALID_ROLES)}"
             )
 
         try:
             response = await self._llm.chat_with_file_context(
                 role=role,
                 user_message=user_message,
-                files=context_files or [],
+                files=[],
                 tier=tier,
                 system_prompt=system_prompt,
             )
 
-            # Record token usage (estimated — the current LLMClient interface
-            # does not expose exact prompt/completion token counts).
             await self._db.log_token_usage(
                 {
-                    "project_id": self._project_id,
+                    "project_id": self.session_id or "unknown",
                     "role": role,
                     "tier": tier,
                     "total_tokens": _estimate_tokens(user_message, response),
@@ -688,298 +591,70 @@ class Orchestrator:
         except LLMClientError:
             raise
         except Exception as exc:
-            logger.error("Unexpected error invoking role %s: %s", role, exc)
+            logger.error("调用 Agent '%s' 时发生异常: %s", role, exc)
             raise LLMClientError(
-                f"Failed to invoke role '{role}': {exc}"
+                f"调用 Agent '{role}' 失败: {exc}"
             ) from exc
 
     # ==================================================================
-    # State-machine helpers
+    # 状态机辅助方法
     # ==================================================================
 
     def _compute_next_state(self) -> WorkflowState:
-        """Determine the next state based on the current state and phase results.
-
-        Returns:
-            The next ``WorkflowState`` to transition to.
-        """
-        current = self._state
-
-        if current == WorkflowState.IDLE:
-            return WorkflowState.PLANNING
-
-        if current == WorkflowState.PLANNING:
-            return WorkflowState.CODING
-
-        if current == WorkflowState.CODING:
-            if not self._modules or self._module_index >= len(self._modules):
-                return WorkflowState.DONE
-            return WorkflowState.AUDITING
-
-        if current == WorkflowState.AUDITING:
-            if self._audit_passed:
-                return WorkflowState.ACCEPTING
-            else:
-                return WorkflowState.CODING
-
-        if current == WorkflowState.ACCEPTING:
-            if self._acceptance_passed:
-                self._module_index += 1
-                if self._module_index < len(self._modules):
-                    return WorkflowState.CODING
-                else:
-                    return WorkflowState.DONE
-            else:
-                return WorkflowState.CODING
-
-        # PAUSED, ERROR, DONE — no automatic transition.
-        return current
+        """根据当前状态计算下一个状态。"""
+        transitions: dict[WorkflowState, WorkflowState] = {
+            WorkflowState.PARSING: WorkflowState.QUIZ_GEN,
+            WorkflowState.QUIZ_GEN: WorkflowState.EVALUATING,
+            WorkflowState.EVALUATING: WorkflowState.PLANNING,
+            WorkflowState.PLANNING: WorkflowState.DONE,
+        }
+        return transitions.get(self._state, self._state)
 
     def _transition_to(self, new_state: WorkflowState) -> None:
-        """Update the state machine to *new_state* and log the transition.
-
-        Args:
-            new_state: The target state.
-        """
-        old_state = self._state
+        """执行状态转换并记录日志。"""
+        old = self._state
         self._state = new_state
-        logger.info("State transition: %s → %s", old_state.value, new_state.value)
+        logger.info("状态转换: %s → %s", old.value, new_state.value)
 
     async def _execute_phase(self, state: WorkflowState) -> None:
-        """Execute the phase corresponding to *state*.
+        """根据状态执行对应阶段。"""
+        phase_map = {
+            WorkflowState.PARSING: self._parsing_phase,
+            WorkflowState.QUIZ_GEN: self._quiz_gen_phase,
+            WorkflowState.EVALUATING: self._evaluating_phase,
+            WorkflowState.PLANNING: self._planning_phase,
+        }
 
-        Args:
-            state: The state whose phase should be executed.
-        """
-        if state == WorkflowState.CODING:
-            await self._coding_phase()
-        elif state == WorkflowState.AUDITING:
-            await self._auditing_phase()
-        elif state == WorkflowState.ACCEPTING:
-            await self._accepting_phase()
+        handler = phase_map.get(state)
+        if handler:
+            await handler()
         elif state == WorkflowState.DONE:
-            logger.info("Workflow complete — all modules accepted.")
-        # PLANNING is handled by ``start()``, not via ``proceed()``.
+            logger.info("流水线已完成 —— 全部阶段执行完毕。")
 
-        # Reset the per-step retry counter after any successful phase execution
-        # so that the limit of _MAX_STEP_RETRIES applies per-step, not globally
-        # across the entire workflow lifetime (see audit A3).
+        # 成功后重置重试计数器
         self._step_retry_count = 0
 
     def _handle_phase_error(self, exc: Exception) -> None:
-        """Handle a phase-level error by transitioning to ERROR state.
-
-        Args:
-            exc: The exception that caused the error.
-        """
+        """将阶段异常转为 ERROR 状态。"""
         self._error_message = str(exc)
         self._previous_state = self._state
         self._transition_to(WorkflowState.ERROR)
-        logger.error("Phase failed with error: %s", exc)
+        logger.error("阶段执行失败: %s", exc)
 
     # ==================================================================
-    # Result parsing
+    # 持久化 & Agent 状态辅助
     # ==================================================================
 
-    @staticmethod
-    def _parse_audit_result(response: str) -> bool:
-        """Parse the audit response to determine pass/fail.
-
-        Looks for explicit pass/fail markers near the end of the response.
-        When no clear marker is found, a heuristic word-count comparison
-        in the final portion of the text is used as a fallback.
-
-        Args:
-            response: The full audit report text.
-
-        Returns:
-            ``True`` if the audit passed, ``False`` otherwise.
-        """
-        response_lower = response.lower()
-
-        # Explicit markers (Chinese + English).
-        pass_markers = [
-            "通过 (pass)",
-            "**通过**",
-            "结论：通过",
-            "结论: 通过",
-            "verdict: pass",
-        ]
-        fail_markers = [
-            "驳回 (fail)",
-            "**驳回**",
-            "结论：驳回",
-            "结论: 驳回",
-            "verdict: fail",
-        ]
-
-        for marker in pass_markers:
-            if marker in response_lower:
-                return True
-        for marker in fail_markers:
-            if marker in response_lower:
-                return False
-
-        # Heuristic: compare pass/fail keyword frequency in the last 2000 chars.
-        tail = response_lower[-2000:]
-        pass_score = tail.count("pass") + tail.count("通过")
-        fail_score = tail.count("fail") + tail.count("驳回") + tail.count("不通过")
-        return pass_score >= fail_score
-
-    @staticmethod
-    def _parse_acceptance_result(response: str) -> bool:
-        """Parse the acceptance response to determine pass/fail.
-
-        Uses the same logic as ``_parse_audit_result``.
-
-        Args:
-            response: The full acceptance report text.
-
-        Returns:
-            ``True`` if the module was accepted, ``False`` otherwise.
-        """
-        return Orchestrator._parse_audit_result(response)
-
-    # ==================================================================
-    # Task-board parsing
-    # ==================================================================
-
-    async def _parse_task_board(self) -> list[dict[str, Any]]:
-        """Parse the task board to extract the module list.
-
-        Reads ``constitution/task-board.md`` and extracts module entries
-        — lines matching ``### Mn: ...`` or ``### Mn ...``.  Each module's
-        description (all lines between its header and the next header) is
-        captured as the ``tasks`` field.
-
-        Returns:
-            A list of module dicts, each containing keys ``id`` (e.g.
-            ``"M1"``), ``name`` (human-readable title), and ``tasks``
-            (the body text under that module heading).  Returns an empty
-            list when the task board file is missing or unreadable.
-        """
-        task_board_path = self._project_root / "constitution" / "task-board.md"
-        if not task_board_path.is_file():
-            logger.warning("Task board not found at %s", task_board_path)
-            return []
-
-        content = task_board_path.read_text(encoding="utf-8")
-        modules: list[dict[str, Any]] = []
-        current_module: dict[str, Any] | None = None
-        tasks_lines: list[str] = []
-
-        for line in content.splitlines():
-            stripped = line.strip()
-
-            # Detect module headers: "### Mn" or "### Mn: Title"
-            if re.match(r"^###\s+M\d+", stripped, re.IGNORECASE):
-                # Save the previous module before starting a new one.
-                if current_module is not None:
-                    current_module["tasks"] = "\n".join(tasks_lines).strip()
-                    modules.append(current_module)
-
-                header = stripped.lstrip("#").strip()
-                if ":" in header:
-                    parts = header.split(":", 1)
-                    mod_id = parts[0].strip()
-                    mod_name = parts[1].strip()
-                else:
-                    mod_id = header
-                    mod_name = header
-
-                current_module = {"id": mod_id, "name": mod_name}
-                tasks_lines = []
-            elif current_module is not None:
-                tasks_lines.append(line)
-
-        # Save the last module.
-        if current_module is not None:
-            current_module["tasks"] = "\n".join(tasks_lines).strip()
-            modules.append(current_module)
-
-        logger.info("Parsed %d modules from task board.", len(modules))
-        return modules
-
-    # ==================================================================
-    # Persistence helpers
-    # ==================================================================
-
-    async def _persist_planning_artifacts(self, response: str) -> None:
-        """Parse the Claude-A planning response and write individual files.
-
-        Splits the response on markdown headings that specify file paths
-        (e.g. ``### constitution/requirements.md``) and writes each
-        section to the corresponding path under the project root.  When no
-        such headings are detected the entire response is saved as
-        ``constitution/planning-output.md``.
-
-        Args:
-            response: The full planning response text from Claude-A.
-        """
-        # Split on headings that name a file inside a known zone.
-        zone_pattern = "|".join(self._fs.ZONES)
-        section_pattern = re.compile(
-            rf"\n(?=##\s+(?:`?)(?:{zone_pattern})/[^\s`\n]+(?:`?)\n)",
-        )
-
-        sections = section_pattern.split(response)
-
-        if len(sections) <= 1:
-            # No structured sections found — save as a single planning note.
-            self._fs.write_file("claude-a", "constitution/planning-output.md", response)
-            logger.info("Planning output written to constitution/planning-output.md")
-            return
-
-        for section in sections:
-            if not section.strip():
-                continue
-
-            # Extract the file path from the heading (first line).
-            first_line = section.split("\n")[0]
-            path_match = re.match(
-                r"^##\s+(?:`?)((?:constitution|sandbox|src|test|review|artifacts)/[^\s`\n]+)(?:`?)",
-                first_line,
-            )
-            if path_match:
-                file_path = path_match.group(1)
-                zone = file_path.split("/")[0]
-                if zone in self._fs.ZONES:
-                    try:
-                        self._fs.write_file("claude-a", file_path, section.strip())
-                        logger.info("Planning artifact written to %s", file_path)
-                    except Exception as exc:
-                        logger.warning(
-                            "Failed to write planning artifact %s: %s", file_path, exc
-                        )
-            else:
-                # Section without a recognisable path — append to planning notes.
-                existing = ""
-                notes_path = "constitution/planning-output.md"
-                try:
-                    existing = self._fs.read_file("claude-a", notes_path)
-                except FileNotFoundError:
-                    pass
-                self._fs.write_file("claude-a", notes_path, existing + "\n" + section)
-
-    async def _on_step_complete(self, role: str, artifact: dict[str, Any]) -> None:
-        """Hook called after each phase step completes.
-
-        Persists the artifact to the database.  (Git auto-commit will be
-        wired in when ``git_manager`` is integrated.)
-
-        Args:
-            role: The role that produced the artifact.
-            artifact: Artifact metadata dict with keys ``type``, ``title``,
-                ``summary_256``, ``full_text``, ``file_path``, ``module``
-                (optional), and ``version`` (optional).
-        """
+    async def _on_step_complete(
+        self, role: str, artifact: dict[str, Any]
+    ) -> None:
+        """阶段完成回调：将产出物写入数据库。"""
         try:
             await self._db.insert_artifact(
                 {
-                    "project_id": self._project_id,
+                    "project_id": self.session_id or "unknown",
                     "role": role,
-                    "type": artifact.get("type", "code"),
-                    "module": artifact.get("module"),
+                    "type": artifact.get("type", "generic"),
                     "title": artifact.get("title", ""),
                     "summary_256": artifact.get("summary_256", ""),
                     "full_text": artifact.get("full_text", ""),
@@ -990,170 +665,235 @@ class Orchestrator:
             )
         except Exception as exc:
             logger.warning(
-                "Failed to persist artifact for role %s (module=%s): %s",
-                role,
-                artifact.get("module"),
-                exc,
+                "产出物持久化失败 (role=%s): %s", role, exc
             )
 
-    # ==================================================================
-    # Role-status helpers
-    # ==================================================================
-
-    def _set_role_status(self, role: str, status: str, task: str | None = None) -> None:
-        """Update the tracked status for an AI role.
-
-        Args:
-            role: Role identifier (``"claude-a"``, ``"codex"``, ``"claude-b"``).
-            status: Human-readable status string (``"idle"``, ``"active"``,
-                ``"error"``).
-            task: Optional description of the current task.
-        """
-        self._role_statuses[role] = status
-        self._role_tasks[role] = task
+    def _set_role_status(
+        self, role: AgentRole, status: str, task: Optional[str] = None
+    ) -> None:
+        """更新 Agent 的追踪状态。"""
+        self._role_statuses[role.value] = status
+        self._role_tasks[role.value] = task
 
 
 # ======================================================================
-# Module-level helpers (prompt builders + file collectors)
+# 阶段 Prompt 构建函数（模块级辅助函数）
 # ======================================================================
 
 
-def _build_planning_prompt() -> str:
-    """Build the user prompt for the planning phase (Claude-A)."""
+def _build_parsing_prompt(material_id: str) -> str:
+    """构建 PDF 解析阶段的用户提示词。"""
     return (
-        "请为以下新项目生成完整的规划文档集：\n\n"
-        "1. **需求文档** — 写入 `constitution/requirements.md`\n"
-        "   - 功能需求清单（P0 / P1 / P2 优先级）\n"
-        "   - 非功能需求（性能、安全、可用性）\n"
-        "   - 用户故事或用例描述\n\n"
-        "2. **项目宪法** — 写入 `constitution/constitution.md`\n"
-        "   - 技术架构规范（技术栈、架构模式、目录结构）\n"
-        "   - 接口 / API 规范\n"
-        "   - 代码风格规范（Python + TypeScript）\n"
-        "   - 测试规范\n"
-        "   - Git 提交规范\n"
-        "   - 禁止事项\n\n"
-        "3. **接口规范** — 写入 `constitution/api-spec.yaml`\n"
-        "   - REST API 端点定义（OpenAPI 3.0 格式）\n"
-        "   - 数据模型定义\n"
-        "   - 错误码定义\n\n"
-        "4. **任务清单** — 写入 `constitution/task-board.md`\n"
-        "   - 按模块拆分（M1, M2, M3 …）\n"
-        "   - 每个模块标注负责人、预估工时、状态\n"
-        "   - 详细任务子项（checkbox 格式）\n\n"
-        "请参考已有项目结构和技术栈生成上述文件。每个文件必须完整、可执行，"
-        "能够直接作为 Codex 的开发指令。"
+        "你是一位教学资料分析专家。请分析以下学习材料，将其拆分为独立的知识片段。\n\n"
+        f"材料 ID: {material_id}\n\n"
+        "## 输出要求\n"
+        "将材料内容按知识点边界切分为多个 chunk，每个 chunk 包含：\n"
+        "1. **content**: 原文片段（保持完整语义，200-2000 字）\n"
+        "2. **summary**: 一句话摘要（≤256 字符）\n"
+        "3. **topic**: 主题标签（如'牛顿定律'、'矩阵运算'）\n"
+        "4. **difficulty**: 难度评估（beginner / easy / medium / hard / expert）\n"
+        "5. **keywords**: 3-5 个关键词\n\n"
+        "请以 JSON 数组格式输出，格式为：\n"
+        '```json\n{"chunks": [{"content": "...", "summary": "...", '
+        '"topic": "...", "difficulty": "medium", "keywords": ["..."]}]}\n```\n\n'
+        "注意：\n"
+        "- 保持原文语义完整，不要截断句子\n"
+        "- 数学公式/代码块保持原样\n"
+        "- 按原文顺序排列 chunks"
     )
 
 
-def _build_coding_prompt(
-    module_id: str,
-    module_name: str,
-    module_tasks: str,
+def _build_quiz_gen_prompt(chunks: list[dict[str, Any]]) -> str:
+    """构建题目生成阶段的用户提示词。"""
+    # 限制 chunks 数量以避免 prompt 过长
+    chunks_preview = chunks[:15] if len(chunks) > 15 else chunks
+    chunks_json = _safe_truncate_json(chunks_preview, max_items=15)
+
+    return (
+        "你是一位资深教学出题专家。请根据以下知识片段生成一套测验题。\n\n"
+        f"## 知识片段（共 {len(chunks)} 个）\n"
+        f"```json\n{chunks_json}\n```\n\n"
+        "## 出题要求\n"
+        "1. 每个知识片段至少出 1 道题\n"
+        "2. 题型以选择题（multiple_choice）为主，可含少量简答题（short_answer）\n"
+        "3. 难度分布：记忆 30% / 理解 40% / 应用 20% / 分析 10%\n"
+        "4. 每道题包含：\n"
+        "   - **stem**: 题干\n"
+        "   - **type**: 题目类型\n"
+        "   - **options**: 选项列表 [{'key': 'A', 'text': '...'}, ...]\n"
+        "   - **correct_answer**: 正确答案\n"
+        "   - **explanation**: 详细解析\n"
+        "   - **difficulty**: 难度评估\n"
+        "   - **knowledge_node_ids**: 考查的知识点\n\n"
+        "请以 JSON 数组格式输出：\n"
+        '```json\n{"questions": [{"stem": "...", "type": "multiple_choice", '
+        '"options": [...], "correct_answer": "A", "explanation": "...", '
+        '"difficulty": "easy", "knowledge_node_ids": ["..."]}]}\n```'
+    )
+
+
+def _build_evaluating_prompt(
+    questions: list[dict[str, Any]],
+    student_answers: list[dict[str, Any]],
 ) -> str:
-    """Build the user prompt for the coding phase (Codex)."""
+    """构建批改诊断阶段的用户提示词。"""
+    questions_json = _safe_truncate_json(questions, max_items=20)
+    answers_json = _safe_truncate_json(student_answers, max_items=20)
+
     return (
-        f"请实现以下模块：\n\n"
-        f"## 模块: {module_id} — {module_name}\n\n"
-        f"### 任务描述\n{module_tasks}\n\n"
-        f"### 要求\n"
-        f"1. 所有代码写入 `sandbox/{module_id}/` 目录\n"
-        f"2. 严格遵循 `constitution/constitution.md` 中的规范\n"
-        f"3. 参考 `constitution/api-spec.yaml` 中的接口定义\n"
-        f"4. 包含完整的类型注解和 docstring\n"
-        f"5. 如涉及数据库，参考 constitution 中的数据模型\n\n"
-        f"请开始编码。"
+        "你是一位严谨的教学评估专家。请批改学生的作答并诊断其迷思概念。\n\n"
+        f"## 题目\n```json\n{questions_json}\n```\n\n"
+        f"## 学生作答\n```json\n{answers_json}\n```\n\n"
+        "## 评估要求\n"
+        "1. 逐题判定对错（is_correct）\n"
+        "2. 为错题诊断迷思概念（misconception）：\n"
+        "   - **label**: 错误标签（如'动量与动能混淆'）\n"
+        "   - **category**: 错误类别（conceptual / calculation / careless / "
+        "application / logic / notation / incomplete）\n"
+        "   - **description**: 错误详细描述\n"
+        "   - **remediation_hint**: 补救建议\n"
+        "3. 为每道错题提供一条苏格拉底式引导提示（不直接给答案，引导学生自己发现）\n\n"
+        "请以 JSON 格式输出：\n"
+        '```json\n{\n'
+        '  "attempts": [{"question_id": "...", "is_correct": false, '
+        '"score": 0.0, "misconception_ids": ["..."]}],\n'
+        '  "misconceptions": [{"label": "...", "category": "conceptual", '
+        '"description": "...", "remediation_hint": "..."}]\n'
+        '}\n```'
     )
 
 
-def _build_audit_prompt(module_id: str) -> str:
-    """Build the user prompt for the auditing phase (Claude-B)."""
+def _build_planning_prompt(
+    attempts: list[dict[str, Any]],
+    misconceptions: list[dict[str, Any]],
+) -> str:
+    """构建排期计划阶段的用户提示词。"""
+    attempts_json = _safe_truncate_json(attempts, max_items=20)
+    misconceptions_json = _safe_truncate_json(misconceptions, max_items=10)
+
     return (
-        f"请审计以下模块的代码产出：\n\n"
-        f"## 审计目标: {module_id}\n\n"
-        f"### 审计标准\n"
-        f"1. 对照 `constitution/constitution.md` 检查代码是否符合宪法规范\n"
-        f"2. 对照 `constitution/api-spec.yaml` 检查接口实现是否正确\n"
-        f"3. 检查代码风格（Black / Ruff 规范）\n"
-        f"4. 检查类型注解完整性\n"
-        f"5. 检查 docstring 完整性\n"
-        f"6. 检查是否有安全漏洞或禁止事项违规\n\n"
-        f"### 审计结论\n"
-        f"请在报告末尾明确给出结论：\n"
-        f"- **通过 (PASS)**: 代码符合所有规范，可以进入验收阶段\n"
-        f"- **驳回 (FAIL)**: 代码存在问题，需要 Codex 修改（请列出具体问题）\n\n"
-        f"请将审计报告写入 `test/{module_id}-audit.md`。"
+        "你是一位学习规划专家。请根据学生的作答表现和迷思概念诊断，"
+        "制定一份基于 SM-2 算法的间隔重复复习计划。\n\n"
+        f"## 作答记录\n```json\n{attempts_json}\n```\n\n"
+        f"## 迷思概念\n```json\n{misconceptions_json}\n```\n\n"
+        "## 排期要求\n"
+        "1. 对每个未掌握的知识点，安排复习条目（review item）\n"
+        "2. 使用 SM-2 算法计算复习间隔：\n"
+        "   - 首次学习: 1 天后复习\n"
+        "   - 第二次: 6 天后复习\n"
+        "   - 之后: interval = previous_interval × EF\n"
+        "3. 优先级规则：薄弱知识点 × 逾期天数（弱且紧急的排前面）\n"
+        "4. 每天学习量不超过 2 小时\n"
+        "5. 每个复习条目包含：\n"
+        "   - **scheduled_date**: 计划复习日期\n"
+        "   - **activity_type**: review / practice / quiz\n"
+        "   - **estimated_minutes**: 预计耗时\n"
+        "   - **knowledge_node_id**: 对应知识点\n\n"
+        "请以 JSON 数组格式输出：\n"
+        '```json\n{"plan_items": [{"scheduled_date": "2025-01-01", '
+        '"activity_type": "review", "estimated_minutes": 15, '
+        '"knowledge_node_id": "..."}]}\n```'
     )
 
 
-def _build_acceptance_prompt(module_id: str) -> str:
-    """Build the user prompt for the acceptance phase (Claude-A)."""
-    return (
-        f"请验收以下模块：\n\n"
-        f"## 验收目标: {module_id}\n\n"
-        f"### 验收标准\n"
-        f"1. 代码输出是否符合需求文档 (`constitution/requirements.md`)\n"
-        f"2. 代码是否符合项目宪法 (`constitution/constitution.md`)\n"
-        f"3. 接口实现是否符合接口规范 (`constitution/api-spec.yaml`)\n"
-        f"4. Claude-B 的审计报告中的问题是否已解决\n"
-        f"5. 代码是否可以直接合并到 `src/` 目录\n\n"
-        f"### 验收结论\n"
-        f"请在报告末尾明确给出结论：\n"
-        f"- **通过 (PASS)**: 模块合格，可以合并到 src/\n"
-        f"- **驳回 (FAIL)**: 模块存在问题，需要 Codex 修改（请列出具体问题）\n\n"
-        f"请将验收报告写入 `review/acceptance/{module_id}.md`。"
-    )
+# ======================================================================
+# 通用辅助函数
+# ======================================================================
+
+import json as _json
 
 
-def _collect_constitution_files(project_root: Path, *filenames: str) -> list[str]:
-    """Collect absolute paths to constitution files that actually exist.
+def _safe_parse_json_list(
+    response: str, key: str
+) -> list[dict[str, Any]]:
+    """从 LLM 响应中安全提取 JSON 列表。
+
+    使用 4 层防御策略：
+    1. 直接 ``json.loads`` 整个响应
+    2. 正则提取 ```json ... ``` 围栏代码块
+    3. 正则提取第一个 ``{...}`` 或 ``[...]``
+    4. 返回空列表
 
     Args:
-        project_root: The project root directory.
-        *filenames: File names inside ``constitution/`` to look for.
+        response: LLM 原始响应文本。
+        key: 期望的 JSON 对象键名（如 ``"chunks"``、``"questions"``）。
 
     Returns:
-        A list of absolute path strings for files that exist on disk.
+        解析出的字典列表，失败时返回空列表。
     """
-    files: list[str] = []
-    for name in filenames:
-        path = project_root / "constitution" / name
-        if path.is_file():
-            files.append(str(path))
-    return files
+    # 第 1 层：尝试直接解析整个响应
+    try:
+        data = _json.loads(response)
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict) and key in data:
+            items = data[key]
+            return items if isinstance(items, list) else [items]
+    except (_json.JSONDecodeError, TypeError):
+        pass
+
+    # 第 2 层：提取 ```json ... ``` 围栏代码块
+    import re
+
+    fence_match = re.search(
+        r"```(?:json)?\s*\n?([\s\S]*?)\n?```", response
+    )
+    if fence_match:
+        try:
+            data = _json.loads(fence_match.group(1).strip())
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict) and key in data:
+                items = data[key]
+                return items if isinstance(items, list) else [items]
+        except (_json.JSONDecodeError, TypeError):
+            pass
+
+    # 第 3 层：查找第一个 JSON 对象或数组
+    json_match = re.search(r"(\[.*\]|\{.*\})", response, re.DOTALL)
+    if json_match:
+        try:
+            data = _json.loads(json_match.group(1))
+            if isinstance(data, list):
+                return data
+            if isinstance(data, dict) and key in data:
+                items = data[key]
+                return items if isinstance(items, list) else [items]
+        except (_json.JSONDecodeError, TypeError):
+            pass
+
+    # 第 4 层：放弃，返回空列表
+    logger.warning(
+        "_safe_parse_json_list: 无法解析 LLM 响应为 JSON，"
+        "key=%s，响应前 200 字符: %s",
+        key,
+        response[:200],
+    )
+    return []
 
 
-def _collect_sandbox_files(project_root: Path, module_id: str) -> list[str]:
-    """Collect absolute paths to all files in a sandbox module directory.
+def _safe_truncate_json(
+    items: list[dict[str, Any]], max_items: int = 15
+) -> str:
+    """将列表截断并序列化为 JSON 字符串。
+
+    超过 ``max_items`` 时自动截断并附加占位提示。
 
     Args:
-        project_root: The project root directory.
-        module_id: The module identifier (e.g. ``"M1"``).
+        items: 待序列化的字典列表。
+        max_items: 最大保留条数。
 
     Returns:
-        A list of absolute path strings for every regular file under
-        ``sandbox/{module_id}/``.  Returns an empty list when the
-        directory does not exist.
+        JSON 字符串。
     """
-    sandbox_dir = project_root / "sandbox" / module_id
-    if not sandbox_dir.is_dir():
-        return []
-    return [str(p) for p in sandbox_dir.rglob("*") if p.is_file()]
+    truncated = items[:max_items]
+    result = _json.dumps(truncated, ensure_ascii=False, indent=2)
+    if len(items) > max_items:
+        result += f"\n// ... 共 {len(items)} 条，已截断显示前 {max_items} 条"
+    return result
 
 
 def _estimate_tokens(user_message: str, response: str) -> int:
-    """Rough token-count estimate based on whitespace-delimited word count.
-
-    This is a coarse approximation (words / 0.75).  When an exact token
-    count becomes available from the LLM API response it should replace
-    this helper.
-
-    Args:
-        user_message: The input message text.
-        response: The output response text.
-
-    Returns:
-        Estimated total token count.
-    """
+    """粗略估算 token 数（按英文词数 / 0.75）。"""
     word_count = len(user_message.split()) + len(response.split())
     return max(1, int(word_count / 0.75))
