@@ -4,7 +4,7 @@ import type {
   MaterialStatusResponse,
   CreateSessionRequest,
   SessionResponse,
-  QuestionResponse,
+  QuestionsData,
   SubmitAnswersRequest,
   SubmitAnswersResponse,
   ResultResponse,
@@ -18,21 +18,54 @@ import type {
 
 const BASE = "/api/v1";
 
+// ── Custom error class for API errors ─────────────────────────────────
+
+export class ApiError extends Error {
+  status: number;
+  detail: string;
+  constructor(status: number, message: string, detail = "") {
+    super(message);
+    this.name = "ApiError";
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
 // ── Generic helpers ──────────────────────────────────────────────────
 
 async function request<T>(
   url: string,
-  options?: RequestInit
+  options?: RequestInit & { timeout?: number }
 ): Promise<APIResponse<T>> {
-  const resp = await fetch(url, {
-    headers: { "Content-Type": "application/json", ...options?.headers },
-    ...options,
-  });
-  if (!resp.ok) {
-    const body = await resp.text();
-    throw new Error(`HTTP ${resp.status}: ${body}`);
+  const timeout = options?.timeout ?? 120_000; // default 2 min for LLM calls
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const resp = await fetch(url, {
+      headers: { "Content-Type": "application/json", ...options?.headers },
+      ...options,
+      signal: controller.signal,
+    });
+    clearTimeout(timer);
+
+    if (!resp.ok) {
+      let detail = "";
+      try {
+        const errBody = await resp.json();
+        detail = errBody.detail || "";
+      } catch { /* ignore parse errors */ }
+      throw new ApiError(resp.status, `HTTP ${resp.status}`, detail);
+    }
+    return resp.json();
+  } catch (e: unknown) {
+    clearTimeout(timer);
+    if (e instanceof ApiError) throw e;
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new ApiError(408, "请求超时，服务器仍在处理中，请稍后重试");
+    }
+    throw e;
   }
-  return resp.json();
 }
 
 // ── Materials ────────────────────────────────────────────────────────
@@ -80,7 +113,7 @@ export function createSession(data: CreateSessionRequest) {
 }
 
 export function getQuestions(sessionId: string) {
-  return request<{ questions: QuestionResponse[] }>(
+  return request<QuestionsData>(
     `${BASE}/sessions/${sessionId}/questions`
   );
 }

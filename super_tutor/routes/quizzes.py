@@ -119,6 +119,8 @@ async def create_session(
             "material_id": req.material_id,
             "session_id": session_id,
             "student_id": req.student_id,
+            "question_count": req.question_count,
+            "difficulty": req.difficulty,
         }
     )
 

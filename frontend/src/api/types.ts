@@ -38,8 +38,18 @@ export interface SessionResponse {
   session_id: string;
   material_id: string;
   title: string;
-  state: string;
+  state: string;          // PipelinePhase
+  quiz_status: string;    // QuizStatus
   question_count: number;
+}
+
+/** GET /sessions/{id}/questions 返回的完整 data 形状 */
+export interface QuestionsData {
+  session_id: string;
+  state: string;
+  quiz_status: string;
+  question_count: number;
+  questions: QuestionResponse[];
 }
 
 export interface QuestionResponse {
@@ -84,10 +94,12 @@ export interface AttemptResult {
 
 export interface MisconceptionTag {
   tag_id: string;
-  knowledge_node_id: string;
+  knowledge_node_id?: string;
   label: string;
   description: string;
-  severity: string;
+  category?: string;
+  severity?: string;
+  remediation_hint?: string;
 }
 
 export interface SocraticHint {
@@ -100,13 +112,22 @@ export interface SocraticHint {
   difficulty_adapt: boolean;
 }
 
+export interface ResultSummary {
+  total_questions: number;
+  correct_count: number;
+  accuracy: number;
+  weakest_topic: string;
+  strongest_topic?: string;
+  overall_assessment: string;
+}
+
 export interface ResultResponse {
   session_id: string;
   state: string;
   attempts: AttemptResult[];
   misconceptions: MisconceptionTag[];
   socratic_hints: SocraticHint[];
-  summary: Record<string, unknown>;
+  summary: ResultSummary;
 }
 
 export interface PlanItem {

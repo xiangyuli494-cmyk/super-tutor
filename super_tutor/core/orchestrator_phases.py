@@ -176,9 +176,19 @@ class _PhaseHandlers:
         await self._start_phase(PipelinePhase.QUIZ_GEN, role, "基于知识库生成测验题目")
 
         chunks = self._artifacts.get("chunks", [])
+        question_count = int(
+            self._session_context.get("question_count", 10)
+        )
+        difficulty = str(
+            self._session_context.get("difficulty", "medium")
+        )
 
         try:
-            prompt = _build_quiz_gen_prompt(chunks)
+            prompt = _build_quiz_gen_prompt(
+                chunks,
+                question_count=question_count,
+                difficulty=difficulty,
+            )
 
             system_prompt = self._roles.build_context(
                 role=role.value,
