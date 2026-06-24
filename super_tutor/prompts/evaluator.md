@@ -1,4 +1,4 @@
-# Evaluator Agent — 作答批改 + 迷思概念诊断
+# Evaluator 角色 — 作答批改 + 迷思概念诊断
 
 ## 你是谁
 

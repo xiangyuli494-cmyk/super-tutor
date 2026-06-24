@@ -1,4 +1,4 @@
-"""SQLite + sqlite-vec persistence layer for Super Tutor Agent.
+"""SQLite + sqlite-vec persistence layer for Super Tutor.
 
 Provides structured artifact storage, vector-based semantic search, token-usage
 tracking, and Git commit logging.  Uses aiosqlite for async I/O and attempts to
@@ -193,6 +193,19 @@ class Database:
 
     # -- Super Tutor 专用表 -------------------------------------------------
 
+    _DDL_MATERIALS = """
+    CREATE TABLE IF NOT EXISTS materials (
+        material_id  TEXT PRIMARY KEY,
+        title        TEXT    NOT NULL,
+        content      TEXT    NOT NULL DEFAULT '',
+        subject      TEXT    NOT NULL DEFAULT '',
+        description  TEXT    NOT NULL DEFAULT '',
+        status       TEXT    NOT NULL DEFAULT 'draft',
+        created_at   TEXT    NOT NULL,
+        updated_at   TEXT    NOT NULL
+    );
+    """
+
     _DDL_KNOWLEDGE_CHUNKS = """
     CREATE TABLE IF NOT EXISTS knowledge_chunks (
         chunk_id     TEXT PRIMARY KEY,
@@ -250,6 +263,7 @@ class Database:
     CREATE TABLE IF NOT EXISTS quiz_attempts (
         attempt_id        TEXT PRIMARY KEY,
         session_id        TEXT    NOT NULL,
+        student_id        TEXT    NOT NULL DEFAULT '',
         question_id       TEXT    NOT NULL,
         student_answer    TEXT,
         is_correct        INTEGER,
@@ -266,10 +280,100 @@ class Database:
     );
     CREATE INDEX IF NOT EXISTS idx_attempts_session_id
         ON quiz_attempts(session_id);
+    CREATE INDEX IF NOT EXISTS idx_attempts_student_id
+        ON quiz_attempts(student_id);
     CREATE INDEX IF NOT EXISTS idx_attempts_question_id
         ON quiz_attempts(question_id);
     CREATE INDEX IF NOT EXISTS idx_attempts_is_correct
         ON quiz_attempts(is_correct);
+    """
+
+    _DDL_MASTERY_RECORDS = """
+    CREATE TABLE IF NOT EXISTS mastery_records (
+        record_id              TEXT PRIMARY KEY,
+        student_id             TEXT    NOT NULL,
+        knowledge_node_id      TEXT    NOT NULL,
+        mastery_level          REAL    NOT NULL DEFAULT 0.0,
+        confidence             REAL    NOT NULL DEFAULT 0.5,
+        total_attempts         INTEGER NOT NULL DEFAULT 0,
+        correct_attempts       INTEGER NOT NULL DEFAULT 0,
+        last_attempt_at        TEXT,
+        last_score             REAL,
+        streak                 INTEGER NOT NULL DEFAULT 0,
+        time_spent_total_seconds INTEGER NOT NULL DEFAULT 0,
+        hints_used_total       INTEGER NOT NULL DEFAULT 0,
+        misconception_ids      TEXT    NOT NULL DEFAULT '[]',
+        state                  TEXT    NOT NULL DEFAULT 'new',
+        sm2_repetitions        INTEGER NOT NULL DEFAULT 0,
+        sm2_ease_factor        REAL    NOT NULL DEFAULT 2.5,
+        sm2_interval_days      INTEGER NOT NULL DEFAULT 0,
+        sm2_next_review        TEXT,
+        sm2_last_quality       INTEGER,
+        metadata               TEXT    NOT NULL DEFAULT '{}',
+        created_at             TEXT    NOT NULL,
+        updated_at             TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_mastery_student_id
+        ON mastery_records(student_id);
+    CREATE INDEX IF NOT EXISTS idx_mastery_knowledge_node_id
+        ON mastery_records(knowledge_node_id);
+    """
+
+    _DDL_STUDY_PLANS = """
+    CREATE TABLE IF NOT EXISTS study_plans (
+        plan_id      TEXT PRIMARY KEY,
+        student_id   TEXT    NOT NULL,
+        title        TEXT    NOT NULL DEFAULT '',
+        description  TEXT    NOT NULL DEFAULT '',
+        subject      TEXT    NOT NULL DEFAULT '',
+        goal         TEXT    NOT NULL DEFAULT '',
+        start_date   TEXT    NOT NULL,
+        end_date     TEXT,
+        status       TEXT    NOT NULL DEFAULT 'active',
+        metadata     TEXT    NOT NULL DEFAULT '{}',
+        created_at   TEXT    NOT NULL,
+        updated_at   TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_study_plans_student_id
+        ON study_plans(student_id);
+    """
+
+    _DDL_REVIEW_ITEMS = """
+    CREATE TABLE IF NOT EXISTS review_items (
+        item_id            TEXT PRIMARY KEY,
+        plan_id            TEXT    NOT NULL,
+        student_id         TEXT    NOT NULL,
+        knowledge_node_id  TEXT    NOT NULL,
+        mastery_record_id  TEXT,
+        scheduled_date     TEXT    NOT NULL,
+        activity_type      TEXT    NOT NULL DEFAULT 'review',
+        estimated_minutes  INTEGER NOT NULL DEFAULT 15,
+        completed          INTEGER NOT NULL DEFAULT 0,
+        completed_at       TEXT,
+        notes              TEXT    NOT NULL DEFAULT '',
+        metadata           TEXT    NOT NULL DEFAULT '{}',
+        FOREIGN KEY (plan_id) REFERENCES study_plans(plan_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_review_items_plan_id
+        ON review_items(plan_id);
+    CREATE INDEX IF NOT EXISTS idx_review_items_student_date
+        ON review_items(student_id, scheduled_date);
+    """
+
+    _DDL_SESSIONS = """
+    CREATE TABLE IF NOT EXISTS sessions (
+        session_id        TEXT PRIMARY KEY,
+        state             TEXT NOT NULL DEFAULT 'idle',
+        previous_state    TEXT NOT NULL DEFAULT 'idle',
+        error_message     TEXT,
+        step_retry_count  INTEGER NOT NULL DEFAULT 0,
+        session_context   TEXT NOT NULL DEFAULT '{}',
+        artifacts         TEXT NOT NULL DEFAULT '{}',
+        role_statuses     TEXT NOT NULL DEFAULT '{}',
+        role_tasks        TEXT NOT NULL DEFAULT '{}',
+        created_at        TEXT NOT NULL,
+        updated_at        TEXT NOT NULL
+    );
     """
 
     # ------------------------------------------------------------------
@@ -387,6 +491,7 @@ class Database:
         """Execute all DDL statements to ensure required tables exist."""
         assert self._conn is not None
         ddl_statements = [
+            self._DDL_MATERIALS,
             self._DDL_PROJECTS,
             self._DDL_ARTIFACTS,
             self._DDL_TASK_LOG,
@@ -395,9 +500,22 @@ class Database:
             self._DDL_KNOWLEDGE_CHUNKS,
             self._DDL_QUESTIONS,
             self._DDL_QUIZ_ATTEMPTS,
+            self._DDL_MASTERY_RECORDS,
+            self._DDL_STUDY_PLANS,
+            self._DDL_REVIEW_ITEMS,
+            self._DDL_SESSIONS,
         ]
         for ddl in ddl_statements:
             await self._conn.executescript(ddl)
+
+        # -- Migration: add student_id column to quiz_attempts (v0.2→v0.3) --
+        try:
+            await self._conn.execute(
+                "ALTER TABLE quiz_attempts ADD COLUMN student_id TEXT NOT NULL DEFAULT ''"
+            )
+        except Exception:
+            pass  # column already exists — fine
+
         await self._conn.commit()
 
     async def _init_vector_search(self) -> None:
@@ -540,6 +658,70 @@ class Database:
         )
         await self._conn.commit()
         return project["id"]
+
+    # ==================================================================
+    # Material CRUD
+    # ==================================================================
+
+    async def create_material(self, material: dict[str, Any]) -> str:
+        """Insert a new learning material record.
+
+        Args:
+            material: A dict with at least ``"material_id"``, ``"title"``,
+                ``"content"``, ``"created_at"``, ``"updated_at"``.
+                Optional keys: ``"subject"``, ``"description"``, ``"status"``.
+
+        Returns:
+            The ``material_id`` of the newly created row.
+        """
+        assert self._conn is not None
+        await self._conn.execute(
+            """INSERT INTO materials (material_id, title, content, subject,
+               description, status, created_at, updated_at)
+               VALUES (:material_id, :title, :content, :subject,
+                       :description, :status, :created_at, :updated_at)""",
+            {
+                "material_id": material["material_id"],
+                "title": material["title"],
+                "content": material.get("content", ""),
+                "subject": material.get("subject", ""),
+                "description": material.get("description", ""),
+                "status": material.get("status", "draft"),
+                "created_at": material["created_at"],
+                "updated_at": material["updated_at"],
+            },
+        )
+        await self._conn.commit()
+        return material["material_id"]
+
+    async def get_material(self, material_id: str) -> Optional[dict[str, Any]]:
+        """Retrieve a single material by its ID.
+
+        Args:
+            material_id: The material UUID.
+
+        Returns:
+            A dict with material fields, or *None* if not found.
+        """
+        assert self._conn is not None
+        cursor = await self._conn.execute(
+            "SELECT * FROM materials WHERE material_id = ?", (material_id,)
+        )
+        row = await cursor.fetchone()
+        return self._row_to_dict(row) if row else None
+
+    async def list_materials(self) -> list[dict[str, Any]]:
+        """List all materials, ordered by creation time (newest first).
+
+        Returns:
+            A list of material dicts (may be empty).
+        """
+        assert self._conn is not None
+        cursor = await self._conn.execute(
+            "SELECT * FROM materials ORDER BY created_at DESC"
+        )
+        rows = await cursor.fetchall()
+        return self._rows_to_dicts(rows)
 
     # ==================================================================
     # Artifact CRUD + search
@@ -979,7 +1161,9 @@ class Database:
 
         # Total across all roles.
         cursor = await self._conn.execute(
-            """SELECT COALESCE(SUM(total_tokens), 0) AS total,
+            """SELECT COALESCE(SUM(prompt_tokens), 0) AS total_prompt,
+                      COALESCE(SUM(completion_tokens), 0) AS total_completion,
+                      COALESCE(SUM(total_tokens), 0) AS total,
                       COUNT(*) AS call_count
                FROM token_usage
                WHERE project_id = ?""",
@@ -989,17 +1173,29 @@ class Database:
 
         # Per-role breakdown.
         cursor = await self._conn.execute(
-            """SELECT role, COALESCE(SUM(total_tokens), 0) AS tokens
+            """SELECT role,
+                      COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                      COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                      COALESCE(SUM(total_tokens), 0) AS tokens
                FROM token_usage
                WHERE project_id = ?
                GROUP BY role""",
             (project_id,),
         )
         role_rows = await cursor.fetchall()
-        by_role: dict[str, int] = {r["role"]: r["tokens"] for r in role_rows}
+        by_role: dict[str, dict[str, int]] = {
+            r["role"]: {
+                "total_tokens": r["tokens"],
+                "prompt_tokens": r["prompt_tokens"],
+                "completion_tokens": r["completion_tokens"],
+            }
+            for r in role_rows
+        }
 
         return {
             "project_id": project_id,
+            "total_prompt_tokens": total_row["total_prompt"] if total_row else 0,
+            "total_completion_tokens": total_row["total_completion"] if total_row else 0,
             "total_tokens": total_row["total"] if total_row else 0,
             "by_role": by_role,
             "call_count": total_row["call_count"] if total_row else 0,
@@ -1287,16 +1483,17 @@ class Database:
 
         await self._conn.execute(
             """INSERT INTO quiz_attempts
-               (attempt_id, session_id, question_id, student_answer, is_correct,
+               (attempt_id, session_id, student_id, question_id, student_answer, is_correct,
                 score, time_spent_seconds, hints_used, attempt_number, confidence,
                 misconception_ids, note, started_at, submitted_at, metadata)
                VALUES
-               (:attempt_id, :session_id, :question_id, :student_answer, :is_correct,
+               (:attempt_id, :session_id, :student_id, :question_id, :student_answer, :is_correct,
                 :score, :time_spent_seconds, :hints_used, :attempt_number, :confidence,
                 :misconception_ids, :note, :started_at, :submitted_at, :metadata)""",
             {
                 "attempt_id": attempt["attempt_id"],
                 "session_id": attempt["session_id"],
+                "student_id": attempt.get("student_id", ""),
                 "question_id": attempt["question_id"],
                 "student_answer": student_answer,
                 "is_correct": (
@@ -1390,3 +1587,288 @@ class Database:
         )
         row = await cursor.fetchone()
         return row["cnt"] if row else 0
+
+    async def list_attempts_by_student(
+        self,
+        student_id: str,
+        is_correct: Optional[bool] = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """List quiz attempts filtered by student, with optional correctness filter.
+
+        Args:
+            student_id: The student identifier.
+            is_correct: Optional correctness filter (True = correct only, False = wrong only).
+            limit: Max rows to return.
+            offset: Pagination offset.
+
+        Returns:
+            A tuple of (items, total_count).
+        """
+        assert self._conn is not None
+
+        params: list[Any] = [student_id]
+        where = "WHERE student_id = ?"
+        if is_correct is not None:
+            where += " AND is_correct = ?"
+            params.append(1 if is_correct else 0)
+
+        # Total count
+        count_cursor = await self._conn.execute(
+            f"SELECT COUNT(*) FROM quiz_attempts {where}", params
+        )
+        count_row = await count_cursor.fetchone()
+        total = count_row[0] if count_row else 0
+
+        # Paginated rows
+        cursor = await self._conn.execute(
+            f"""SELECT * FROM quiz_attempts {where}
+                ORDER BY submitted_at DESC
+                LIMIT ? OFFSET ?""",
+            params + [limit, offset],
+        )
+        rows = await cursor.fetchall()
+        return (self._rows_to_dicts(rows), total)
+
+    # ==================================================================
+    # Mastery Record CRUD
+    # ==================================================================
+
+    async def upsert_mastery_record(self, record: dict[str, Any]) -> str:
+        """Insert or replace a mastery record.
+
+        Uses INSERT OR REPLACE so repeated evaluations for the same
+        (student_id, knowledge_node_id) update the existing row.
+
+        Args:
+            record: Dict with fields matching ``MasteryRecord`` model.
+                Required: ``record_id``, ``student_id``, ``knowledge_node_id``,
+                ``created_at``, ``updated_at``.
+
+        Returns:
+            The ``record_id`` of the upserted row.
+        """
+        assert self._conn is not None
+        await self._conn.execute(
+            """INSERT OR REPLACE INTO mastery_records
+               (record_id, student_id, knowledge_node_id, mastery_level, confidence,
+                total_attempts, correct_attempts, last_attempt_at, last_score, streak,
+                time_spent_total_seconds, hints_used_total, misconception_ids, state,
+                sm2_repetitions, sm2_ease_factor, sm2_interval_days, sm2_next_review,
+                sm2_last_quality, metadata, created_at, updated_at)
+               VALUES
+               (:record_id, :student_id, :knowledge_node_id, :mastery_level, :confidence,
+                :total_attempts, :correct_attempts, :last_attempt_at, :last_score, :streak,
+                :time_spent_total_seconds, :hints_used_total, :misconception_ids, :state,
+                :sm2_repetitions, :sm2_ease_factor, :sm2_interval_days, :sm2_next_review,
+                :sm2_last_quality, :metadata, :created_at, :updated_at)""",
+            {
+                "record_id": record["record_id"],
+                "student_id": record["student_id"],
+                "knowledge_node_id": record["knowledge_node_id"],
+                "mastery_level": record.get("mastery_level", 0.0),
+                "confidence": record.get("confidence", 0.5),
+                "total_attempts": record.get("total_attempts", 0),
+                "correct_attempts": record.get("correct_attempts", 0),
+                "last_attempt_at": record.get("last_attempt_at"),
+                "last_score": record.get("last_score"),
+                "streak": record.get("streak", 0),
+                "time_spent_total_seconds": record.get("time_spent_total_seconds", 0),
+                "hints_used_total": record.get("hints_used_total", 0),
+                "misconception_ids": json.dumps(record.get("misconception_ids", [])),
+                "state": record.get("state", "new"),
+                "sm2_repetitions": record.get("sm2_repetitions", 0),
+                "sm2_ease_factor": record.get("sm2_ease_factor", 2.5),
+                "sm2_interval_days": record.get("sm2_interval_days", 0),
+                "sm2_next_review": record.get("sm2_next_review"),
+                "sm2_last_quality": record.get("sm2_last_quality"),
+                "metadata": json.dumps(record.get("metadata", {})),
+                "created_at": record["created_at"],
+                "updated_at": record["updated_at"],
+            },
+        )
+        await self._conn.commit()
+        return record["record_id"]
+
+    async def list_mastery_records(
+        self, student_id: str
+    ) -> list[dict[str, Any]]:
+        """List all mastery records for a student.
+
+        Args:
+            student_id: The student identifier.
+
+        Returns:
+            A list of mastery record dicts, ordered by mastery_level ascending
+            (weakest first).
+        """
+        assert self._conn is not None
+        cursor = await self._conn.execute(
+            """SELECT * FROM mastery_records
+               WHERE student_id = ?
+               ORDER BY mastery_level ASC""",
+            (student_id,),
+        )
+        rows = await cursor.fetchall()
+        return self._rows_to_dicts(rows)
+
+    # ==================================================================
+    # Study Plan & Review Item CRUD
+    # ==================================================================
+
+    async def create_study_plan(
+        self, plan: dict[str, Any], items: list[dict[str, Any]]
+    ) -> str:
+        """Create a study plan with its review items in a single transaction.
+
+        Args:
+            plan: Dict with ``plan_id``, ``student_id``, ``start_date``,
+                ``created_at``, ``updated_at``. Optional: ``title``,
+                ``description``, ``subject``, ``goal``, ``end_date``, ``status``.
+            items: List of review item dicts, each with ``item_id``, ``plan_id``,
+                ``student_id``, ``knowledge_node_id``, ``scheduled_date``.
+                Optional: ``mastery_record_id``, ``activity_type``,
+                ``estimated_minutes``, ``notes``.
+
+        Returns:
+            The ``plan_id`` of the newly created plan.
+        """
+        assert self._conn is not None
+
+        await self._conn.execute(
+            """INSERT INTO study_plans
+               (plan_id, student_id, title, description, subject, goal,
+                start_date, end_date, status, metadata, created_at, updated_at)
+               VALUES
+               (:plan_id, :student_id, :title, :description, :subject, :goal,
+                :start_date, :end_date, :status, :metadata, :created_at, :updated_at)""",
+            {
+                "plan_id": plan["plan_id"],
+                "student_id": plan["student_id"],
+                "title": plan.get("title", ""),
+                "description": plan.get("description", ""),
+                "subject": plan.get("subject", ""),
+                "goal": plan.get("goal", ""),
+                "start_date": plan["start_date"],
+                "end_date": plan.get("end_date"),
+                "status": plan.get("status", "active"),
+                "metadata": json.dumps(plan.get("metadata", {})),
+                "created_at": plan["created_at"],
+                "updated_at": plan["updated_at"],
+            },
+        )
+
+        for item in items:
+            await self._conn.execute(
+                """INSERT INTO review_items
+                   (item_id, plan_id, student_id, knowledge_node_id,
+                    mastery_record_id, scheduled_date, activity_type,
+                    estimated_minutes, completed, completed_at, notes, metadata)
+                   VALUES
+                   (:item_id, :plan_id, :student_id, :knowledge_node_id,
+                    :mastery_record_id, :scheduled_date, :activity_type,
+                    :estimated_minutes, :completed, :completed_at, :notes, :metadata)""",
+                {
+                    "item_id": item["item_id"],
+                    "plan_id": item["plan_id"],
+                    "student_id": item["student_id"],
+                    "knowledge_node_id": item.get("knowledge_node_id", ""),
+                    "mastery_record_id": item.get("mastery_record_id"),
+                    "scheduled_date": item["scheduled_date"],
+                    "activity_type": item.get("activity_type", "review"),
+                    "estimated_minutes": item.get("estimated_minutes", 15),
+                    "completed": 1 if item.get("completed") else 0,
+                    "completed_at": item.get("completed_at"),
+                    "notes": item.get("notes", ""),
+                    "metadata": json.dumps(item.get("metadata", {})),
+                },
+            )
+
+        await self._conn.commit()
+        return plan["plan_id"]
+
+    async def get_today_items(
+        self, student_id: str, date_str: str
+    ) -> list[dict[str, Any]]:
+        """Get review items scheduled for a student on a specific date.
+
+        Args:
+            student_id: The student identifier.
+            date_str: ISO 8601 date string (e.g. ``"2026-06-23"``).
+
+        Returns:
+            A list of review item dicts ordered by activity_type.
+        """
+        assert self._conn is not None
+        cursor = await self._conn.execute(
+            """SELECT * FROM review_items
+               WHERE student_id = ? AND scheduled_date = ?
+               ORDER BY activity_type, estimated_minutes""",
+            (student_id, date_str),
+        )
+        rows = await cursor.fetchall()
+        return self._rows_to_dicts(rows)
+
+    # ------------------------------------------------------------------
+    # Session persistence (P2-4)
+    # ------------------------------------------------------------------
+
+    async def save_session(self, session_data: dict[str, Any]) -> None:
+        """Persist an orchestrator session to the ``sessions`` table.
+
+        Uses INSERT OR REPLACE so repeated saves are idempotent.
+
+        Args:
+            session_data: Dict with keys matching the ``sessions`` table
+                columns.  ``session_context``, ``artifacts``,
+                ``role_statuses``, and ``role_tasks`` are JSON-encoded
+                automatically.
+        """
+        assert self._conn is not None
+        await self._conn.execute(
+            """INSERT OR REPLACE INTO sessions
+               (session_id, state, previous_state, error_message,
+                step_retry_count, session_context, artifacts,
+                role_statuses, role_tasks, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                session_data["session_id"],
+                session_data["state"],
+                session_data["previous_state"],
+                session_data.get("error_message"),
+                session_data.get("step_retry_count", 0),
+                json.dumps(session_data.get("session_context", {})),
+                json.dumps(session_data.get("artifacts", {})),
+                json.dumps(session_data.get("role_statuses", {})),
+                json.dumps(session_data.get("role_tasks", {})),
+                session_data.get("created_at", ""),
+                session_data.get("updated_at", ""),
+            ),
+        )
+        await self._conn.commit()
+
+    async def load_session(self, session_id: str) -> dict[str, Any] | None:
+        """Load a persisted orchestrator session.
+
+        Args:
+            session_id: The session to restore.
+
+        Returns:
+            A dict with deserialized JSON fields, or ``None`` if not found.
+        """
+        assert self._conn is not None
+        cursor = await self._conn.execute(
+            "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        data = dict(row)
+        # Deserialize JSON fields
+        for field in ("session_context", "artifacts", "role_statuses", "role_tasks"):
+            try:
+                data[field] = json.loads(data[field])
+            except (json.JSONDecodeError, TypeError):
+                data[field] = {}
+        return data

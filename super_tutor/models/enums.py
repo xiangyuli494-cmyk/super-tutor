@@ -1,4 +1,4 @@
-"""Super Tutor Agent — 全项目共用枚举定义。
+"""Super Tutor — 全项目共用枚举定义。
 
 所有枚举统一在此模块定义，其他模块通过 ``from super_tutor.models.enums import ...`` 引用。
 """
@@ -7,11 +7,11 @@ from enum import Enum
 
 
 # ============================================================================
-# AgentRole — AI 角色标识
+# AIRole — AI 角色标识
 # ============================================================================
 
 
-class AgentRole(str, Enum):
+class AIRole(str, Enum):
     """教学流水线中的 AI 角色。
 
     每个角色有独立的系统提示词、能力边界和分工，由 RoleManager 统一调度。
@@ -77,41 +77,27 @@ class QuizStatus(str, Enum):
 # ============================================================================
 
 
-class WorkflowState(str, Enum):
-    """三 Agent 协作流水线的状态机状态。
+class PipelinePhase(str, Enum):
+    """教学流水线的五个线性阶段。
 
-    注解中标注了每个状态的用途和负责的 Agent：
+    五个阶段按序推进：
 
     * **IDLE**        — 空闲，等待用户触发
-    * **PARSING**     — Parser Agent 解析 PDF → 切片 → 向量化
-    * **QUIZ_GEN**    — QuizMaster Agent 基于知识库生成题目
-    * **EVALUATING**  — Evaluator Agent 批改作答、诊断迷思概念
-    * **PLANNING**    — Planner Agent 生成 SM-2 排期计划
-    * **DONE**        — 本轮学习闭环完成
-    * **PAUSED**      — 用户手动暂停
-    * **ERROR**       — 异常中断，需要人工介入或重试
+    * **PARSING**     — 解析 PDF → 切片 → 向量化
+    * **QUIZ_GEN**    — 基于知识库生成题目
+    * **EVALUATING**  — 批改作答、诊断迷思概念
+    * **PLANNING**    — 生成 SM-2 排期计划
 
-    .. note::
-
-        以下状态为旧版遗留，保留以兼容历史数据，
-        新代码请使用上述 Super Tutor 状态：
-
-        * **CODING**      — 旧版编码阶段 → 等同于 PARSING + QUIZ_GEN
-        * **AUDITING**    — 旧版审计阶段 → 等同于 EVALUATING
-        * **ACCEPTING**   — 旧版验收阶段 → 等同于 PLANNING
+    注：PAUSED 和 ERROR 不再是独立的枚举值，改为 Orchestrator
+    上的 ``_paused: bool`` 和 ``_error_message: str | None`` 字段。
+    DONE 由 ``phase == PLANNING and not paused and not error`` 隐式表示。
     """
 
-    # -- Super Tutor 状态 ----------------------------------------------------
     IDLE = "idle"
     PARSING = "parsing"
     QUIZ_GEN = "quiz_gen"
     EVALUATING = "evaluating"
     PLANNING = "planning"
-    DONE = "done"
-    PAUSED = "paused"
-    ERROR = "error"
 
-    # -- 旧版遗留状态（保留以兼容历史数据）-----------------------------------
-    CODING = "coding"
-    AUDITING = "auditing"
-    ACCEPTING = "accepting"
+# 向后兼容别名（旧代码中仍可能从枚举模块导入 WorkflowState）
+WorkflowState = PipelinePhase  # type: ignore[assignment]

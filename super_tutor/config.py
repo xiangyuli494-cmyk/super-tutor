@@ -1,4 +1,4 @@
-"""Configuration management for Super Tutor Agent.
+"""Configuration management for Super Tutor.
 
 Reads settings from ~/.super-tutor/settings.json with env-var override (TUTOR_ prefix).
 """
@@ -10,7 +10,7 @@ from typing import Optional
 
 
 class TutorConfig:
-    """Super Tutor Agent 单例配置管理器。
+    """Super Tutor 单例配置管理器。
 
     Attributes:
         deepseek_api_key: DeepSeek API 密钥。
@@ -21,7 +21,7 @@ class TutorConfig:
     _instance: Optional["TutorConfig"] = None
 
     def __init__(self) -> None:
-        self.deepseek_api_key: str = ""
+        self.deepseek_api_key: str = "sk-450706775cb54e0191b6968821fa1804"
         self.deepseek_base_url: str = "https://api.deepseek.com"
         self.token_budget_default: int = 1_000_000
 
