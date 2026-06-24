@@ -1,8 +1,8 @@
 # 超级私教 (Super Tutor) — 技术架构文档
 
 **文档编号：** STA-ARCH-2026-001
-**版本：** v1.0
-**状态：** 与代码同步
+**版本：** v1.1
+**状态：** 与代码同步（重构后更新）
 **密级：** 内部
 
 ---
@@ -77,12 +77,15 @@ FastAPI Server (127.0.0.1:8765)
 
 ```
 super-tutor-agent/
-├── super_tutor/           # Python 后端 (7,500+ 行)
+├── super_tutor/           # Python 后端
 │   ├── main.py            # FastAPI 入口 + lifespan
 │   ├── config.py          # 配置管理（settings.json + env）
 │   ├── core/
-│   │   ├── orchestrator.py # 流水线引擎（~1,500 行）
-│   │   ├── database.py    # SQLite + sqlite-vec (13 表, 1,874 行)
+│   │   ├── orchestrator.py           # 流水线引擎 + 状态机核心（~515 行）
+│   │   ├── orchestrator_phases.py    # 4 阶段实现（Mixin，~585 行）★v1.1
+│   │   ├── orchestrator_prompts.py   # 各阶段 Prompt 构建（~180 行）★v1.1
+│   │   ├── orchestrator_utils.py     # JSON 解析 + 模型水合（~170 行）★v1.1
+│   │   ├── database.py    # SQLite + sqlite-vec (13 表, ~1,900 行)
 │   │   ├── llm_client.py  # DeepSeek API 封装 + CLI 回退
 │   │   ├── role_manager.py # 角色系统提示词加载
 │   │   ├── token_tracker.py # Token 预算管控
@@ -97,7 +100,7 @@ super-tutor-agent/
 │       ├── components/    # 可复用组件 (6 个)
 │       ├── pages/         # 页面组件 (5 个)
 │       └── store/         # Zustand 状态管理 (2 个)
-├── tests/                 # pytest 测试套件 (5 文件, 18 用例)
+├── tests/                 # pytest 测试套件 (5 文件, 25 用例)
 ├── docs/
 │   ├── requirements.md    # 产品需求规格说明书
 │   └── architecture.md    # 本文件
@@ -304,7 +307,7 @@ QuizSession (1) ──< (N) QuizAttempt ────> MisconceptionTag
 |------|------|-----------|
 | `IDLE` | 空闲，等待用户触发 | — |
 | `PARSING` | 解析 PDF → 切片 → 向量化 | Tutor |
-| `QUIZ_GEN` | 基于知识库生成题目 | Assistant |
+| `QUIZ_GEN` | 基于知识库生成题目（支持自适应模式 ★v1.1） | Assistant |
 | `EVALUATING` | 批改作答 + 迷思概念诊断 | Evaluator |
 | `PLANNING` | 综合数据生成 SM-2 排期计划 | Tutor |
 
@@ -332,6 +335,34 @@ IDLE ──start()──▶ PARSING ──proceed()──▶ QUIZ_GEN
 | Assistant（助教） | `assistant` | `prompts/assistant.md` | heavy | 检索知识库 + 出题 |
 | Evaluator（评估者） | `evaluator` | `prompts/evaluator.md` | medium | 批改 + 迷思概念诊断 |
 
+### 5.4 自适应出题（v1.1 ★新增）
+
+QUIZ_GEN 阶段在构建出题 prompt 前会查询 `mastery_records` 表，将学生掌握度数据注入 LLM 上下文，引导出题偏向薄弱知识点。
+
+**数据流：**
+```
+_quiz_gen_phase()
+  ① → list_mastery_records(student_id)      # 查询历史掌握度
+  ② → 匹配 chunks[*].knowledge_node_ids ↔ mastery_records
+  ③ → 生成 mastery_summary（按掌握度升序排列）
+  ④ → _build_quiz_gen_prompt(chunks, mastery_summary)
+  ⑤ → LLM 按自适应规则出题
+```
+
+**出题分配策略：**
+
+| 掌握度 | 状态 | 题目占比 | 说明 |
+|--------|------|:---:|------|
+| < 40% | new / learning | ≥ 50% | 每节点 2-3 题，重点覆盖 |
+| 40-70% | reviewing | 30-40% | 每节点 1-2 题，适量巩固 |
+| > 70% | mastered | ≤ 20% | 每节点 0-1 题，复习/变式为主 |
+
+**容错：** 首次用户（无 mastery 数据）或查询失败 → 回退到均匀出题模式，行为与 v1.0 完全一致。
+
+实现位置：
+- 查询逻辑：`super_tutor/core/orchestrator_phases.py` → `_quiz_gen_phase()`
+- Prompt 构建：`super_tutor/core/orchestrator_prompts.py` → `_build_quiz_gen_prompt()`
+
 ---
 
 ## 第 6 章 · SM-2 算法规格
@@ -346,7 +377,7 @@ IDLE ──start()──▶ PARSING ──proceed()──▶ QUIZ_GEN
 | 通过阈值 | quality ≥ 3 | [0, 5] | 评分 ≥ 3 算通过 |
 | 掌握度更新 (EMA) | `α=0.3, decay=0.4` | — | 正确 MA+=α(1-MA)，错误 MA*=decay |
 
-实现位置：`super_tutor/core/orchestrator.py` → `_persist_mastery_records()`
+实现位置：`super_tutor/core/orchestrator_phases.py` → `_persist_mastery_records()`
 
 ---
 
@@ -361,7 +392,7 @@ LLM 输出的 JSON 可能包含 Markdown 围栏或格式噪音。解析器采用
 第 4 层：返回 []（兜底，不抛异常）
 ```
 
-实现位置：`super_tutor/core/orchestrator.py` → `_safe_parse_json_list()`
+实现位置：`super_tutor/core/orchestrator_utils.py` → `_safe_parse_json_list()`
 
 ---
 
@@ -392,7 +423,7 @@ LLM 输出的 JSON 可能包含 Markdown 围栏或格式噪音。解析器采用
 | 流水线 | 任意阶段 → pause → resume → 恢复正确 | P1 |
 | 流水线 | 异常 → retry_step 超过 3 次 → 保持错误 | P1 |
 
-当前测试覆盖：18 个 pytest 用例，覆盖 materials / quizzes / dashboard / tokens 四个模块。
+当前测试覆盖：25 个 pytest 用例，覆盖 materials / quizzes / dashboard / tokens 四个模块。
 
 ---
 

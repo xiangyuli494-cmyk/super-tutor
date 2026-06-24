@@ -276,6 +276,19 @@ def test_app(test_db: Database, fake_llm: FakeLLMClient) -> FastAPI:
     return app
 
 
+@pytest.fixture(autouse=True)
+def reset_limiter() -> None:
+    """Reset rate limiter storage before each test to avoid 429 errors.
+
+    slowapi uses a global in-memory store shared across all tests.
+    Without this reset, tests that call rate-limited endpoints
+    (e.g. POST /api/v1/materials/upload) will fail after 10 calls.
+    """
+    from super_tutor.core.limiter import limiter
+
+    limiter._storage.reset()
+
+
 @pytest.fixture
 def client(test_app: FastAPI) -> TestClient:
     """Create a synchronous TestClient for the test app."""

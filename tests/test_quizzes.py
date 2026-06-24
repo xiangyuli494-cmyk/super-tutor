@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 from fastapi.testclient import TestClient
+
+if TYPE_CHECKING:
+    from fastapi import FastAPI
 
 
 class TestQuizSessions:
@@ -186,3 +191,133 @@ class TestQuizSessions:
         """GET questions for nonexistent session → 404."""
         resp = client.get("/api/v1/sessions/nonexistent-session/questions")
         assert resp.status_code == 404, resp.text
+
+    # ==================================================================
+    # Phase 2: 状态恢复端点测试
+    # ==================================================================
+
+    async def test_restore_session_in_memory(self, client: TestClient):
+        """POST /restore — 会话已在内存中，返回无需恢复。"""
+        material_id = await self._upload_material(client)
+        create_resp = client.post("/api/v1/sessions", json={
+            "material_id": material_id, "title": "恢复测试",
+            "student_id": "student-1",
+        })
+        session_id = create_resp.json()["data"]["session_id"]
+
+        resp = client.post(f"/api/v1/sessions/{session_id}/restore")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["data"]["state"] == "idle"
+        assert "已在内存" in data["message"]
+
+    async def test_restore_nonexistent_session(self, client: TestClient):
+        """POST /restore — 不存在的会话 → 404。"""
+        resp = client.post("/api/v1/sessions/nonexistent-id/restore")
+        assert resp.status_code == 404, resp.text
+
+    async def test_resume_not_paused(self, client: TestClient):
+        """POST /resume — 未暂停的会话应返回 409。"""
+        material_id = await self._upload_material(client)
+        create_resp = client.post("/api/v1/sessions", json={
+            "material_id": material_id, "title": "恢复测试",
+            "student_id": "student-1",
+        })
+        session_id = create_resp.json()["data"]["session_id"]
+
+        resp = client.post(f"/api/v1/sessions/{session_id}/resume")
+        # 未暂停时 resume 应报错
+        assert resp.status_code == 409, resp.text
+
+    async def test_retry_not_in_error(self, client: TestClient):
+        """POST /retry — 未处于错误状态的会话应返回 409。"""
+        material_id = await self._upload_material(client)
+        create_resp = client.post("/api/v1/sessions", json={
+            "material_id": material_id, "title": "重试测试",
+            "student_id": "student-1",
+        })
+        session_id = create_resp.json()["data"]["session_id"]
+
+        resp = client.post(f"/api/v1/sessions/{session_id}/retry")
+        # 未处于错误状态时 retry 应报错
+        assert resp.status_code == 409, resp.text
+
+    async def test_session_persistence_across_restart(
+        self, client: TestClient, test_app: "FastAPI",
+    ):
+        """模拟服务重启：清除注册表后，访问会话应自动从 DB 恢复。
+
+        验证流程：
+        1. 创建会话 → DB 持久化
+        2. 清除内存注册表（模拟重启）
+        3. 访问同一 session_id → 自动从 DB 恢复
+        """
+        material_id = await self._upload_material(client)
+
+        # 1. 创建会话
+        create_resp = client.post("/api/v1/sessions", json={
+            "material_id": material_id, "title": "持久化测试",
+            "student_id": "student-1",
+        })
+        session_id = create_resp.json()["data"]["session_id"]
+
+        # 2. 触发流水线（生成题目，写入 DB）
+        questions_resp = client.get(f"/api/v1/sessions/{session_id}/questions")
+        assert questions_resp.status_code == 200
+        state_before = questions_resp.json()["data"]["state"]
+
+        # 3. 模拟服务重启：清空内存注册表
+        registry = test_app.state.tutor_orchestrator_registry
+        registry.clear()
+
+        # 4. 再次访问 → 应从 DB 自动恢复
+        resp = client.get(f"/api/v1/sessions/{session_id}/questions")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        # 题目应从 DB 返回（不是重新生成）
+        assert data["data"]["question_count"] >= 1
+        # 状态应保持一致
+        assert data["data"]["state"] == state_before
+
+    async def test_restore_from_db_after_clear(
+        self, client: TestClient, test_app: "FastAPI",
+    ):
+        """POST /restore — 注册表清空后手动恢复，应从 DB 加载。"""
+        material_id = await self._upload_material(client)
+
+        create_resp = client.post("/api/v1/sessions", json={
+            "material_id": material_id, "title": "DB 恢复测试",
+            "student_id": "student-1",
+        })
+        session_id = create_resp.json()["data"]["session_id"]
+
+        # 清空注册表
+        test_app.state.tutor_orchestrator_registry.clear()
+
+        # 手动恢复
+        resp = client.post(f"/api/v1/sessions/{session_id}/restore")
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["data"]["state"] == "idle"
+        assert "已从数据库" in data["message"]
+
+    async def test_create_session_persists_immediately(
+        self, client: TestClient, test_app: "FastAPI",
+    ):
+        """创建会话后立即清空注册表，验证 DB 中有数据。"""
+        material_id = await self._upload_material(client)
+
+        create_resp = client.post("/api/v1/sessions", json={
+            "material_id": material_id, "title": "立即持久化测试",
+            "student_id": "student-1",
+        })
+        session_id = create_resp.json()["data"]["session_id"]
+
+        # 立即清空注册表（会话只创建了，还没做任何操作）
+        test_app.state.tutor_orchestrator_registry.clear()
+
+        # 访问会话 → 应从 DB 自动恢复（IDLE 状态）
+        resp = client.get(f"/api/v1/sessions/{session_id}/questions")
+        assert resp.status_code == 200, resp.text
+        # IDLE 状态应触发流水线启动
+        assert resp.json()["data"]["question_count"] >= 1
