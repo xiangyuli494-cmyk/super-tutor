@@ -1,7 +1,7 @@
 # 超级私教 (Super Tutor) — 技术架构文档
 
 **文档编号：** STA-ARCH-2026-001
-**版本：** v1.0
+**版本：** v1.1
 **状态：** 与代码同步
 **密级：** 内部
 
@@ -77,12 +77,16 @@ FastAPI Server (127.0.0.1:8765)
 
 ```
 super-tutor-agent/
-├── super_tutor/           # Python 后端 (7,500+ 行)
+├── super_tutor/           # Python 后端 (8,000+ 行)
+│   ├── __init__.py        # 版本号声明 (v0.3.0)
 │   ├── main.py            # FastAPI 入口 + lifespan
 │   ├── config.py          # 配置管理（settings.json + env）
 │   ├── core/
-│   │   ├── orchestrator.py # 流水线引擎（~1,500 行）
-│   │   ├── database.py    # SQLite + sqlite-vec (13 表, 1,874 行)
+│   │   ├── orchestrator.py           # 流水线状态机核心 (837 行)
+│   │   ├── orchestrator_phases.py    # 四阶段 Mixin 实现 (751 行)
+│   │   ├── orchestrator_prompts.py   # LLM Prompt 构建函数 (182 行)
+│   │   ├── orchestrator_utils.py     # JSON 解析/模型水合/图谱 (257 行)
+│   │   ├── database.py    # SQLite + sqlite-vec (14 表, 2,000 行)
 │   │   ├── llm_client.py  # DeepSeek API 封装 + CLI 回退
 │   │   ├── role_manager.py # 角色系统提示词加载
 │   │   ├── token_tracker.py # Token 预算管控
@@ -346,7 +350,7 @@ IDLE ──start()──▶ PARSING ──proceed()──▶ QUIZ_GEN
 | 通过阈值 | quality ≥ 3 | [0, 5] | 评分 ≥ 3 算通过 |
 | 掌握度更新 (EMA) | `α=0.3, decay=0.4` | — | 正确 MA+=α(1-MA)，错误 MA*=decay |
 
-实现位置：`super_tutor/core/orchestrator.py` → `_persist_mastery_records()`
+实现位置：`super_tutor/core/orchestrator_phases.py` → `_persist_mastery_records()`
 
 ---
 
@@ -361,7 +365,7 @@ LLM 输出的 JSON 可能包含 Markdown 围栏或格式噪音。解析器采用
 第 4 层：返回 []（兜底，不抛异常）
 ```
 
-实现位置：`super_tutor/core/orchestrator.py` → `_safe_parse_json_list()`
+实现位置：`super_tutor/core/orchestrator_utils.py` → `_safe_parse_json_list()`
 
 ---
 
