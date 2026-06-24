@@ -9,7 +9,7 @@ export default function Layout({ children }: { children: ReactNode }) {
         {children}
       </main>
       <footer className="text-center text-sm text-gray-400 py-4 border-t">
-        Super Tutor v0.2.0
+        Super Tutor v0.3.0
       </footer>
     </div>
   );

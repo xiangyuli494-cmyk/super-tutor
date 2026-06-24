@@ -44,6 +44,26 @@ export function uploadMaterial(data: MaterialUploadRequest) {
   });
 }
 
+export async function uploadPdfFile(
+  file: File,
+  title: string,
+  subject?: string
+): Promise<APIResponse<MaterialStatusResponse>> {
+  const form = new FormData();
+  form.append("file", file);
+  form.append("title", title);
+  if (subject) form.append("subject", subject);
+  const resp = await fetch(`${BASE}/materials/upload/file`, {
+    method: "POST",
+    body: form,
+  });
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`HTTP ${resp.status}: ${body}`);
+  }
+  return resp.json();
+}
+
 export function getMaterialStatus(materialId: string) {
   return request<MaterialStatusResponse>(
     `${BASE}/materials/${materialId}/status`
@@ -118,6 +138,17 @@ export function getWrongQuestions(
 export function getTodayPlan(studentId: string) {
   return request<PlanTodayResponse>(
     `${BASE}/students/${studentId}/plan/today`
+  );
+}
+
+export function togglePlanItem(
+  studentId: string,
+  itemId: string,
+  completed: boolean
+) {
+  return request<{ item_id: string; completed: boolean }>(
+    `${BASE}/students/${studentId}/plan/items/${itemId}/toggle`,
+    { method: "POST", body: JSON.stringify({ completed }) }
   );
 }
 

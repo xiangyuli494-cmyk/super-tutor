@@ -25,9 +25,14 @@ from super_tutor.core.exceptions import LLMClientError, TutorError, VALID_ROLES
 from super_tutor.core.llm_client import LLMClient
 from super_tutor.core.role_manager import RoleManager
 from super_tutor.models.enums import AIRole, PipelinePhase
-from super_tutor.models.knowledge import KnowledgeChunk
+from super_tutor.models.knowledge import (
+    KnowledgeChunk,
+    KnowledgeEdge,
+    KnowledgeGraph,
+    KnowledgeNode,
+)
 from super_tutor.models.mastery import ReviewItem
-from super_tutor.models.quiz import MisconceptionTag, Question, QuizAttempt
+from super_tutor.models.quiz import MisconceptionTag, Question, QuizAttempt, SocraticHint
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +156,11 @@ class Orchestrator:
         self._role_tasks: dict[str, Optional[str]] = {
             role.value: None for role in AIRole
         }
+
+        # ------------------------------------------------------------------
+        # 测验生命周期状态（QuizStatus 枚举推进）
+        # ------------------------------------------------------------------
+        self._quiz_status: str = "draft"  # draft→ready→in_progress→submitted→graded→reviewed
 
         # ------------------------------------------------------------------
         # Token 追踪器 — 可选注入，不注入时走 DB 直写（回退路径）
@@ -328,6 +338,7 @@ class Orchestrator:
                 )
 
         self._artifacts["submitted_attempts"] = attempts
+        self._quiz_status = "submitted"  # 学生已提交作答
         logger.info(
             "提交 %d 条学生作答（%d 条成功反序列化为 QuizAttempt）。",
             len(answers),
@@ -453,6 +464,7 @@ class Orchestrator:
         await self._db.save_session({
             "session_id": session_id,
             "user_id": self._session_context.get("student_id", ""),
+            "quiz_status": self._quiz_status,
             "state": self._phase.value,
             "previous_state": self._previous_phase.value,
             "in_progress": 1 if self._in_progress else 0,
@@ -549,6 +561,7 @@ class Orchestrator:
         orch._error_message = data.get("error_message")
         orch._step_retry_count = data.get("step_retry_count", 0)
         orch._in_progress = bool(data.get("in_progress", 0))
+        orch._quiz_status = data.get("quiz_status", "draft")
         orch._session_context = data.get("session_context", {})
 
         # 还原 AI 角色状态
@@ -665,6 +678,7 @@ class Orchestrator:
         """
         return {
             "phase": self._phase.value,
+            "quiz_status": self._quiz_status,
             "paused": self._paused,
             "is_done": self.is_done,
             "session_id": self.session_id,
@@ -759,6 +773,15 @@ class Orchestrator:
             self._artifacts["chunks"] = chunks_raw       # 保留原始 dict 供 LLM prompt
             self._artifacts["chunk_models"] = chunks      # Pydantic 模型供内部消费
             self._artifacts["parsing_output"] = response
+
+            # -- 构建知识图谱（F? 增强） --
+            graph = _build_knowledge_graph(chunks_raw)
+            self._artifacts["knowledge_graph"] = graph.model_dump()
+            logger.info(
+                "KnowledgeGraph: %d nodes, %d edges constructed.",
+                len(graph.nodes),
+                len(graph.edges),
+            )
 
             await self._on_step_complete(
                 role=role.value,
@@ -871,6 +894,7 @@ class Orchestrator:
                 },
             )
 
+            self._quiz_status = "ready"  # 题目已生成，等待学生作答
             await self._end_phase(PipelinePhase.QUIZ_GEN, role)
             logger.info("QUIZ_GEN 阶段完成：%d 道题目。", len(questions))
 
@@ -915,6 +939,15 @@ class Orchestrator:
             attempts_raw = _safe_parse_json_list(response, "attempts")
             misconceptions_raw = _safe_parse_json_list(response, "misconceptions")
 
+            # -- 提取 summary（用于前端展示） --
+            summary_raw: dict[str, Any] = {}
+            try:
+                data = _json.loads(response)
+                if isinstance(data, dict) and "summary" in data:
+                    summary_raw = data["summary"]
+            except (_json.JSONDecodeError, TypeError):
+                pass
+
             session_id = self.session_id or "unknown"
             student_id = self._session_context.get("student_id", "")
             attempts = _hydrate_models(
@@ -926,8 +959,43 @@ class Orchestrator:
                 misconceptions_raw,
                 MisconceptionTag,
             )
+
+            # -- 提取苏格拉底式提示（F8） --
+            socratic_hints_raw: list[dict[str, Any]] = []
+            tag_id_map: dict[int, str] = {}  # 索引 → tag_id 映射
+            for i, m_raw in enumerate(misconceptions_raw):
+                tag_id = m_raw.get("tag_id", str(uuid4()))
+                tag_id_map[i] = tag_id
+                hints_data = m_raw.get("socratic_hints", [])
+                if isinstance(hints_data, list):
+                    for h in hints_data:
+                        if isinstance(h, dict):
+                            socratic_hints_raw.append({
+                                "hint_id": str(uuid4()),
+                                "question_id": m_raw.get("knowledge_node_ids", [""])[0]
+                                if m_raw.get("knowledge_node_ids") else "",
+                                "misconception_tag_id": tag_id,
+                                "level": h.get("level", 1),
+                                "content": h.get("content", ""),
+                                "trigger_after_failures": h.get("trigger_after_failures", 1),
+                                "difficulty_adapt": h.get("difficulty_adapt", True),
+                            })
+
+            # 持久化苏格拉底提示到 DB
+            if socratic_hints_raw:
+                try:
+                    await self._db.insert_socratic_hints_batch(socratic_hints_raw)
+                    logger.info(
+                        "EVALUATING: %d socratic hints persisted.",
+                        len(socratic_hints_raw),
+                    )
+                except Exception as exc:
+                    logger.warning("Failed to persist socratic hints: %s", exc)
+
             self._artifacts["attempts"] = attempts_raw
             self._artifacts["misconceptions"] = misconceptions_raw
+            self._artifacts["socratic_hints"] = socratic_hints_raw
+            self._artifacts["evaluating_summary"] = summary_raw
             self._artifacts["attempt_models"] = attempts
             self._artifacts["misconception_models"] = misconceptions
             self._artifacts["evaluating_output"] = response
@@ -992,6 +1060,7 @@ class Orchestrator:
                 },
             )
 
+            self._quiz_status = "graded"  # 批改完成
             await self._end_phase(PipelinePhase.EVALUATING, role)
             logger.info(
                 "EVALUATING 阶段完成：%d 题已批改，%d 个迷思概念。",
@@ -1128,6 +1197,7 @@ class Orchestrator:
                 },
             )
 
+            self._quiz_status = "reviewed"  # 复习计划已生成，测验闭环完成
             await self._end_phase(PipelinePhase.PLANNING, role)
             logger.info("PLANNING 阶段完成：%d 个排期条目。", len(plan_items))
 
@@ -1559,7 +1629,15 @@ def _build_evaluating_prompt(
         '  "attempts": [{"question_id": "...", "is_correct": false, '
         '"score": 0.0, "misconception_ids": ["..."]}],\n'
         '  "misconceptions": [{"label": "...", "category": "conceptual", '
-        '"description": "...", "remediation_hint": "..."}]\n'
+        '"description": "...", "remediation_hint": "...",\n'
+        '    "socratic_hints": [\n'
+        '      {"level": 1, "content": "笼统引导，让学生意识到问题方向"},\n'
+        '      {"level": 2, "content": "指向具体方向或概念，缩小思考范围"},\n'
+        '      {"level": 3, "content": "接近答案的具体线索，逼近但不等于答案"}\n'
+        '    ]}],\n'
+        '  "summary": {"total_questions": 0, "correct_count": 0, '
+        '"accuracy": 0.0, "weakest_topic": "...", '
+        '"overall_assessment": "..."}\n'
         '}\n```'
     )
 
@@ -1736,3 +1814,79 @@ def _safe_truncate_json(
 def _estimate_tokens(text: str) -> int:
     """粗略估算 token 数（按词数 / 0.75）。"""
     return max(1, int(len(text.split()) / 0.75))
+
+
+def _build_knowledge_graph(
+    chunks_raw: list[dict[str, Any]],
+) -> KnowledgeGraph:
+    """从知识片段构建知识图谱。
+
+    每个 chunk 映射为一个 KnowledgeNode，相同 topic 的节点之间
+    创建双向关联边，相邻 chunk 之间创建顺序边。
+
+    Args:
+        chunks_raw: PARSING 阶段产出的原始 chunk dict 列表。
+
+    Returns:
+        包含节点和边的 KnowledgeGraph 实例。
+    """
+    nodes: list[KnowledgeNode] = []
+    edges: list[KnowledgeEdge] = []
+
+    # 按 topic 分组
+    topic_groups: dict[str, list[int]] = {}
+    for i, c in enumerate(chunks_raw):
+        chunk_id = c.get("chunk_id", str(uuid4()))
+        node = KnowledgeNode(
+            node_id=chunk_id,
+            label=c.get("topic", f"Chunk {i}"),
+            description=c.get("summary", c.get("content", ""))[:256],
+            node_type="concept",
+            subject=c.get("topic", ""),
+            difficulty=c.get("difficulty", "medium"),
+            importance=3,
+            estimated_minutes=5,
+            keywords=c.get("keywords", []),
+            chunk_ids=[chunk_id],
+        )
+        nodes.append(node)
+
+        topic = c.get("topic", "").strip()
+        if topic:
+            topic_groups.setdefault(topic, []).append(i)
+
+    # 同 topic 的节点间创建双向关联边
+    for indices in topic_groups.values():
+        if len(indices) < 2:
+            continue
+        for a_idx in range(len(indices)):
+            for b_idx in range(a_idx + 1, len(indices)):
+                edges.append(KnowledgeEdge(
+                    edge_id=str(uuid4()),
+                    source_id=nodes[indices[a_idx]].node_id,
+                    target_id=nodes[indices[b_idx]].node_id,
+                    relation="related_to",
+                    weight=0.5,
+                    label="same_topic",
+                ))
+                edges.append(KnowledgeEdge(
+                    edge_id=str(uuid4()),
+                    source_id=nodes[indices[b_idx]].node_id,
+                    target_id=nodes[indices[a_idx]].node_id,
+                    relation="related_to",
+                    weight=0.5,
+                    label="same_topic",
+                ))
+
+    # 相邻 chunk 之间创建顺序边（prerequisite 关系）
+    for i in range(len(nodes) - 1):
+        edges.append(KnowledgeEdge(
+            edge_id=str(uuid4()),
+            source_id=nodes[i].node_id,
+            target_id=nodes[i + 1].node_id,
+            relation="prerequisite",
+            weight=0.8,
+            label="sequence",
+        ))
+
+    return KnowledgeGraph(nodes=nodes, edges=edges)

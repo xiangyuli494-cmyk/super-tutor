@@ -76,9 +76,29 @@ export default function FileUpload({ onUploaded }: Props) {
           type="file"
           accept=".pdf"
           className="text-sm"
-          onChange={() => {
-            // PDF upload via FormData — left as future enhancement
-            setError("PDF 上传功能即将推出，请使用文本上传");
+          onChange={async (e) => {
+            const file = e.target.files?.[0];
+            if (!file) return;
+            if (file.size > 50 * 1024 * 1024) {
+              setError("文件大小不能超过 50MB");
+              return;
+            }
+            setLoading(true);
+            setError(null);
+            try {
+              const resp = await api.uploadPdfFile(
+                file,
+                title.trim() || file.name.replace(/\.pdf$/i, ""),
+                subject.trim()
+              );
+              setTitle("");
+              setSubject("");
+              onUploaded?.(resp.data.material_id, resp.data.title);
+            } catch (e: unknown) {
+              setError((e as Error).message);
+            } finally {
+              setLoading(false);
+            }
           }}
         />
       </div>

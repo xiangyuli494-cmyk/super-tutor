@@ -140,6 +140,7 @@ async def create_session(
             material_id=req.material_id,
             title=req.title,
             state=orch.state.value,
+            quiz_status=orch._quiz_status,
             question_count=0,
         ).model_dump()
     )
@@ -193,10 +194,12 @@ async def get_questions(
                     estimated_seconds=q.get("estimated_seconds", 120),
                 ).model_dump()
             )
+        orch._quiz_status = "in_progress"  # 学生已开始查看题目
         return APIResponse(
             data={
                 "session_id": session_id,
                 "state": orch.state.value,
+                "quiz_status": orch._quiz_status,
                 "question_count": len(safe_questions),
                 "questions": safe_questions,
             }
@@ -246,10 +249,12 @@ async def get_questions(
             ).model_dump()
         )
 
+    orch._quiz_status = "in_progress"  # 学生已开始查看题目
     return APIResponse(
         data={
             "session_id": session_id,
             "state": orch.state.value,
+            "quiz_status": orch._quiz_status,
             "question_count": len(safe_questions),
             "questions": safe_questions,
         }
@@ -353,12 +358,14 @@ async def get_results(
 
     attempts = orch._artifacts.get("attempts", [])
     misconceptions = orch._artifacts.get("misconceptions", [])
+    socratic_hints = orch._artifacts.get("socratic_hints", [])
+    summary = orch._artifacts.get("evaluating_summary", {})
 
-    # 从原始 LLM 输出中提取 summary（如果存在）
-    evaluating_output = orch._artifacts.get("evaluating_output", "")
-    summary: dict = {}
-    if isinstance(evaluating_output, dict):
-        summary = evaluating_output.get("summary", {})
+    # 向后兼容：若 summary 为空，尝试从原始 LLM 输出中提取
+    if not summary:
+        evaluating_output = orch._artifacts.get("evaluating_output", "")
+        if isinstance(evaluating_output, dict):
+            summary = evaluating_output.get("summary", {})
 
     return APIResponse(
         data=ResultResponse(
@@ -366,6 +373,7 @@ async def get_results(
             state=orch.state.value,
             attempts=attempts,
             misconceptions=misconceptions,
+            socratic_hints=socratic_hints,
             summary=summary,
         ).model_dump()
     )

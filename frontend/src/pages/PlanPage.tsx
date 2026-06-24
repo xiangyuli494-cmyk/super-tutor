@@ -1,5 +1,6 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useStudentStore } from "../store/studentStore";
+import * as api from "../api/client";
 
 const activityLabels: Record<string, string> = {
   review: "复习",
@@ -10,10 +11,27 @@ const activityLabels: Record<string, string> = {
 export default function PlanPage() {
   const { studentId, todayPlan, loading, error, fetchTodayPlan } =
     useStudentStore();
+  const [togglingIds, setTogglingIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     fetchTodayPlan();
   }, [studentId]);
+
+  async function handleToggle(itemId: string, completed: boolean) {
+    setTogglingIds((prev) => new Set(prev).add(itemId));
+    try {
+      await api.togglePlanItem(studentId, itemId, !completed);
+      await fetchTodayPlan();
+    } catch {
+      // ignore toggle errors, visual stays
+    } finally {
+      setTogglingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(itemId);
+        return next;
+      });
+    }
+  }
 
   return (
     <div>
@@ -30,18 +48,23 @@ export default function PlanPage() {
           {todayPlan.items.map((item) => (
             <div
               key={item.item_id}
-              className={`bg-white rounded-lg shadow p-4 flex items-center gap-4 ${
+              className={`bg-white rounded-lg shadow p-4 flex items-center gap-4 transition-opacity ${
                 item.completed ? "opacity-60" : ""
               }`}
             >
               <input
                 type="checkbox"
                 checked={item.completed}
-                readOnly
-                className="accent-primary-600"
+                disabled={togglingIds.has(item.item_id)}
+                onChange={() => handleToggle(item.item_id, item.completed)}
+                className="accent-primary-600 cursor-pointer"
               />
               <div className="flex-1">
-                <p className="font-medium text-sm">
+                <p
+                  className={`font-medium text-sm ${
+                    item.completed ? "line-through" : ""
+                  }`}
+                >
                   {activityLabels[item.activity_type] || item.activity_type}:{" "}
                   {item.knowledge_node_id}
                 </p>
@@ -51,6 +74,9 @@ export default function PlanPage() {
               </div>
               <div className="text-right text-xs text-gray-400">
                 <p>{item.estimated_minutes} 分钟</p>
+                {togglingIds.has(item.item_id) && (
+                  <p className="text-primary-500">...</p>
+                )}
               </div>
             </div>
           ))}

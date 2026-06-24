@@ -14,6 +14,7 @@ import os
 import struct
 from typing import Any, Optional, Sequence
 import uuid
+from datetime import datetime, timezone
 
 import aiosqlite
 
@@ -380,6 +381,25 @@ class Database:
         ON sessions(user_id);
     """
 
+    _DDL_SOCRATIC_HINTS = """
+    CREATE TABLE IF NOT EXISTS socratic_hints (
+        hint_id                TEXT PRIMARY KEY,
+        question_id            TEXT NOT NULL DEFAULT '',
+        misconception_tag_id   TEXT NOT NULL DEFAULT '',
+        level                  INTEGER NOT NULL DEFAULT 1,
+        content                TEXT NOT NULL DEFAULT '',
+        trigger_after_failures INTEGER NOT NULL DEFAULT 0,
+        difficulty_adapt       INTEGER NOT NULL DEFAULT 0,
+        times_shown            INTEGER NOT NULL DEFAULT 0,
+        was_helpful            INTEGER,
+        created_at             TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_socratic_hints_question
+        ON socratic_hints(question_id);
+    CREATE INDEX IF NOT EXISTS idx_socratic_hints_tag
+        ON socratic_hints(misconception_tag_id);
+    """
+
     # ------------------------------------------------------------------
 
     def __init__(
@@ -508,6 +528,7 @@ class Database:
             self._DDL_STUDY_PLANS,
             self._DDL_REVIEW_ITEMS,
             self._DDL_SESSIONS,
+            self._DDL_SOCRATIC_HINTS,
         ]
         for ddl in ddl_statements:
             await self._conn.executescript(ddl)
@@ -1555,6 +1576,51 @@ class Database:
         await self._conn.commit()
         return attempt["attempt_id"]
 
+    async def insert_socratic_hints_batch(
+        self, hints: list[dict[str, Any]]
+    ) -> int:
+        """Batch insert socratic hints (F8).
+
+        Args:
+            hints: List of dicts with keys: ``hint_id``, ``question_id``,
+                ``misconception_tag_id``, ``level``, ``content``,
+                ``trigger_after_failures``, ``difficulty_adapt``.
+
+        Returns:
+            Number of hints inserted.
+        """
+        assert self._conn is not None
+        if not hints:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        count = 0
+        for h in hints:
+            await self._conn.execute(
+                """INSERT OR REPLACE INTO socratic_hints
+                   (hint_id, question_id, misconception_tag_id, level, content,
+                    trigger_after_failures, difficulty_adapt, times_shown,
+                    was_helpful, created_at)
+                   VALUES
+                   (:hint_id, :question_id, :misconception_tag_id, :level, :content,
+                    :trigger_after_failures, :difficulty_adapt, :times_shown,
+                    :was_helpful, :created_at)""",
+                {
+                    "hint_id": h["hint_id"],
+                    "question_id": h.get("question_id", ""),
+                    "misconception_tag_id": h.get("misconception_tag_id", ""),
+                    "level": h.get("level", 1),
+                    "content": h.get("content", ""),
+                    "trigger_after_failures": h.get("trigger_after_failures", 0),
+                    "difficulty_adapt": 1 if h.get("difficulty_adapt") else 0,
+                    "times_shown": h.get("times_shown", 0),
+                    "was_helpful": h.get("was_helpful"),
+                    "created_at": h.get("created_at", now),
+                },
+            )
+            count += 1
+        await self._conn.commit()
+        return count
+
     async def get_attempt(self, attempt_id: str) -> Optional[dict[str, Any]]:
         """Retrieve a single attempt by ID."""
         assert self._conn is not None
@@ -1847,6 +1913,31 @@ class Database:
         )
         rows = await cursor.fetchall()
         return self._rows_to_dicts(rows)
+
+    async def update_review_item(
+        self, item_id: str, updates: dict[str, Any]
+    ) -> None:
+        """Update fields of a single review item.
+
+        Args:
+            item_id: The review item identifier.
+            updates: Key-value pairs to update (e.g. ``{"completed": True}``).
+        """
+        assert self._conn is not None
+        set_clauses = []
+        values: list[Any] = []
+        for key, value in updates.items():
+            set_clauses.append(f"{key} = ?")
+            if key == "completed":
+                values.append(1 if value else 0)
+            else:
+                values.append(value)
+        values.append(item_id)
+        await self._conn.execute(
+            f"UPDATE review_items SET {', '.join(set_clauses)} WHERE item_id = ?",
+            values,
+        )
+        await self._conn.commit()
 
     # ------------------------------------------------------------------
     # Session persistence (P2-4)

@@ -5,6 +5,7 @@ import type {
   AttemptResult,
   MisconceptionTag,
   PlanItem,
+  SocraticHint,
 } from "../api/types";
 
 interface QuizState {
@@ -20,6 +21,7 @@ interface QuizState {
   answers: Record<string, unknown>;
   results: AttemptResult[];
   misconceptions: MisconceptionTag[];
+  socraticHints: SocraticHint[];
   planItems: PlanItem[];
   planSummary: string;
 
@@ -53,6 +55,7 @@ export const useQuizStore = create<QuizState>((set, get) => ({
   answers: {},
   results: [],
   misconceptions: [],
+  socraticHints: [],
   planItems: [],
   planSummary: "",
 
@@ -127,6 +130,7 @@ export const useQuizStore = create<QuizState>((set, get) => ({
       set({
         results: resp.data.attempts,
         misconceptions: resp.data.misconceptions,
+        socraticHints: resp.data.socratic_hints || [],
         state: resp.data.state,
         loading: false,
       });
@@ -159,6 +163,7 @@ export const useQuizStore = create<QuizState>((set, get) => ({
       answers: {},
       results: [],
       misconceptions: [],
+      socraticHints: [],
       planItems: [],
       planSummary: "",
       loading: false,

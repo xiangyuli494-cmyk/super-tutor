@@ -6,8 +6,15 @@ import ResultCard from "../components/ResultCard";
 export default function ResultsPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
   const navigate = useNavigate();
-  const { results, misconceptions, loading, error, fetchResults, generatePlan } =
-    useQuizStore();
+  const {
+    results,
+    misconceptions,
+    socraticHints,
+    loading,
+    error,
+    fetchResults,
+    generatePlan,
+  } = useQuizStore();
 
   useEffect(() => {
     if (sessionId && results.length === 0) {
@@ -70,9 +77,9 @@ export default function ResultsPage() {
             >
               <span
                 className={`text-xs px-2 py-0.5 rounded mt-0.5 ${
-                  m.severity === "high"
+                  m.severity === "high" || m.severity === "critical"
                     ? "bg-red-100 text-red-700"
-                    : m.severity === "medium"
+                    : m.severity === "medium" || m.severity === "moderate"
                     ? "bg-yellow-100 text-yellow-700"
                     : "bg-blue-100 text-blue-700"
                 }`}
@@ -82,9 +89,63 @@ export default function ResultsPage() {
               <div>
                 <p className="text-sm font-medium">{m.label}</p>
                 <p className="text-xs text-gray-500">{m.description}</p>
+                {m.remediation_hint && (
+                  <p className="text-xs text-primary-700 mt-1">
+                    💡 {m.remediation_hint}
+                  </p>
+                )}
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Socratic Hints (F8) */}
+      {socraticHints.length > 0 && (
+        <div className="bg-amber-50 rounded-lg shadow p-5 mt-4 border border-amber-200">
+          <h2 className="font-semibold mb-3 text-amber-800">
+            🧭 苏格拉底式引导提示
+          </h2>
+          <p className="text-xs text-amber-600 mb-3">
+            以下提示从笼统到具体逐层递进，请先尝试自己思考再展开查看
+          </p>
+          {misconceptions
+            .filter((m) =>
+              socraticHints.some((h) => h.misconception_tag_id === m.tag_id)
+            )
+            .map((m) => {
+              const tagHints = socraticHints.filter(
+                (h) => h.misconception_tag_id === m.tag_id
+              );
+              return (
+                <details
+                  key={m.tag_id}
+                  className="mb-2 border border-amber-300 rounded bg-white"
+                >
+                  <summary className="px-4 py-2 text-sm font-medium cursor-pointer hover:bg-amber-50">
+                    {m.label}
+                    <span className="text-xs text-gray-400 ml-2">
+                      ({tagHints.length} 层提示)
+                    </span>
+                  </summary>
+                  <div className="px-4 pb-3 space-y-2">
+                    {tagHints
+                      .sort((a, b) => a.level - b.level)
+                      .map((h) => (
+                        <div
+                          key={h.hint_id}
+                          className="bg-amber-50 rounded p-3 text-sm"
+                        >
+                          <span className="text-xs font-bold text-amber-600 mr-2">
+                            L{h.level}
+                          </span>
+                          <span className="text-gray-700">{h.content}</span>
+                        </div>
+                      ))}
+                  </div>
+                </details>
+              );
+            })}
         </div>
       )}
 

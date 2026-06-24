@@ -90,11 +90,22 @@ export interface MisconceptionTag {
   severity: string;
 }
 
+export interface SocraticHint {
+  hint_id: string;
+  question_id: string;
+  misconception_tag_id: string;
+  level: number;
+  content: string;
+  trigger_after_failures: number;
+  difficulty_adapt: boolean;
+}
+
 export interface ResultResponse {
   session_id: string;
   state: string;
   attempts: AttemptResult[];
   misconceptions: MisconceptionTag[];
+  socratic_hints: SocraticHint[];
   summary: Record<string, unknown>;
 }
 

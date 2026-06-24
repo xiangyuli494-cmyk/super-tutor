@@ -11,7 +11,7 @@ import logging
 from datetime import date
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
 from super_tutor.core.database import Database
 from super_tutor.routes.dependencies import use_db, use_orchestrator_registry
@@ -246,4 +246,23 @@ async def get_today_plan(
                 for it in items
             ],
         ).model_dump(),
+    )
+
+
+@router.post(
+    "/{student_id}/plan/items/{item_id}/toggle",
+    response_model=APIResponse,
+)
+async def toggle_plan_item(
+    student_id: str,
+    item_id: str,
+    body: dict[str, Any] = Body(...),
+    db: Database = Depends(use_db),
+) -> APIResponse:
+    """切换复习计划条目的完成状态。"""
+    completed = body.get("completed", False)
+    await db.update_review_item(item_id, {"completed": bool(completed)})
+    return APIResponse(
+        data={"item_id": item_id, "completed": bool(completed)},
+        message="ok",
     )

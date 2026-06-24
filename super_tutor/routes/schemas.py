@@ -124,6 +124,7 @@ class SessionResponse(BaseModel):
     material_id: str = Field(..., description="关联的材料 ID")
     title: str = Field(..., description="测验标题")
     state: str = Field(..., description="Orchestrator 工作流状态")
+    quiz_status: str = Field(default="draft", description="测验生命周期状态")
     question_count: int = Field(default=0, description="已生成题目数量")
 
 
@@ -178,6 +179,9 @@ class ResultResponse(BaseModel):
     )
     misconceptions: list[dict[str, Any]] = Field(
         default_factory=list, description="迷思概念诊断"
+    )
+    socratic_hints: list[dict[str, Any]] = Field(
+        default_factory=list, description="苏格拉底式渐进提示 (F8)"
     )
     summary: dict[str, Any] = Field(
         default_factory=dict, description="评估汇总"

@@ -21,7 +21,7 @@ class TutorConfig:
     _instance: Optional["TutorConfig"] = None
 
     def __init__(self) -> None:
-        self.deepseek_api_key: str = "sk-450706775cb54e0191b6968821fa1804"
+        self.deepseek_api_key: str = ""
         self.deepseek_base_url: str = "https://api.deepseek.com"
         self.token_budget_default: int = 1_000_000
 
