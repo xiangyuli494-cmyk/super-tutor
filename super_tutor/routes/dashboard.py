@@ -1,20 +1,19 @@
 """Super Tutor — 学生仪表盘路由。
 
 提供学习概览、掌握度明细、错题本和今日复习清单。
-部分端点依赖 mastery_records 和 study_plans 表（P1 待建），
-当前 MVP 版本从已有数据聚合。
+直接从 knowledge_points / quiz_attempts / wrong_questions 表聚合。
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import date
-from typing import Optional
+from typing import Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 
 from super_tutor.core.database import Database
-from super_tutor.routes.dependencies import use_db, use_orchestrator_registry
+from super_tutor.routes.deps import use_db
 from super_tutor.routes.schemas import (
     APIResponse,
     DashboardResponse,
@@ -40,10 +39,8 @@ async def get_dashboard(
 ) -> APIResponse:
     """获取学生学习仪表盘概览。
 
-    按 student_id 聚合全部 quiz_attempts，计算总体正确率、
-    统计薄弱/优势知识点。
+    聚合 quiz_attempts，计算总体正确率、统计薄弱/优势知识点。
     """
-    # 获取所有作答（不限条数，用于统计）
     all_attempts, _total = await db.list_attempts_by_student(
         student_id, limit=10000, offset=0
     )
@@ -57,38 +54,40 @@ async def get_dashboard(
         )
 
     total_questions = len(all_attempts)
-    correct_count = sum(
-        1 for a in all_attempts if a.get("is_correct")
-    )
+    correct_count = sum(1 for a in all_attempts if a.get("is_correct"))
     overall_accuracy = correct_count / total_questions if total_questions > 0 else 0.0
 
-    # 提取最近 10 条
     recent = all_attempts[:10]
 
-    # 批量查询所有题目（一次 JOIN 替代 N 次 get_question）避免 N+1
+    # Aggregate by kp_id
     question_ids = list({
         a.get("question_id", "") for a in all_attempts if a.get("question_id")
     })
     question_map = await db.get_questions_batch(question_ids)
 
-    topic_stats: dict[str, dict[str, int]] = {}  # topic → {total, correct}
+    kp_stats: dict[str, dict[str, int]] = {}
     for a in all_attempts:
         q = question_map.get(a.get("question_id", ""))
-        topic = q.get("topic", "未分类") if q else "未分类"
-        if topic not in topic_stats:
-            topic_stats[topic] = {"total": 0, "correct": 0}
-        topic_stats[topic]["total"] += 1
+        kp_id = q.get("kp_id", "unknown") if q else "unknown"
+        if kp_id not in kp_stats:
+            kp_stats[kp_id] = {"total": 0, "correct": 0}
+        kp_stats[kp_id]["total"] += 1
         if a.get("is_correct"):
-            topic_stats[topic]["correct"] += 1
+            kp_stats[kp_id]["correct"] += 1
 
+    # Resolve KP titles
     weak_topics: list[str] = []
     strong_topics: list[str] = []
-    for topic, stats in topic_stats.items():
+    for kp_id, stats in kp_stats.items():
         acc = stats["correct"] / stats["total"] if stats["total"] > 0 else 0
+        label = kp_id[:8] + "…"
+        kp_row = await db.get_knowledge_point(kp_id)
+        if kp_row:
+            label = kp_row.get("title", label)
         if acc < 0.6:
-            weak_topics.append(topic)
+            weak_topics.append(label)
         elif acc >= 0.85 and stats["total"] >= 2:
-            strong_topics.append(topic)
+            strong_topics.append(label)
 
     return APIResponse(
         data=DashboardResponse(
@@ -104,7 +103,7 @@ async def get_dashboard(
 
 
 # ===================================================================
-# Mastery — 掌握度明细
+# Mastery — 掌握度明细（从 knowledge_points 读取）
 # ===================================================================
 
 
@@ -115,39 +114,55 @@ async def get_mastery(
 ) -> APIResponse:
     """获取学生各知识点的掌握度明细。
 
-    返回 mastery_records 表中的完整记录，含 SM-2 参数和状态。
+    从 knowledge_points 表读取 mastery_level，并结合 quiz_attempts
+    计算作答统计。
     """
-    records = await db.list_mastery_records(student_id)
+    kps = await db.list_knowledge_points_with_mastery()
+
+    # Get per-KP attempt stats
+    all_attempts, _ = await db.list_attempts_by_student(
+        student_id, limit=10000, offset=0
+    )
+
+    # Aggregate per kp_id
+    kp_attempts: dict[str, dict[str, int]] = {}
+    question_ids = list({a.get("question_id", "") for a in all_attempts if a.get("question_id")})
+    question_map = await db.get_questions_batch(question_ids)
+
+    for a in all_attempts:
+        q = question_map.get(a.get("question_id", ""))
+        kp_id = q.get("kp_id", "") if q else ""
+        if not kp_id:
+            continue
+        if kp_id not in kp_attempts:
+            kp_attempts[kp_id] = {"total": 0, "correct": 0}
+        kp_attempts[kp_id]["total"] += 1
+        if a.get("is_correct"):
+            kp_attempts[kp_id]["correct"] += 1
 
     items: list[dict] = []
-    for r in records:
+    for kp in kps:
+        kp_id = kp.get("kp_id", "")
+        stats = kp_attempts.get(kp_id, {"total": 0, "correct": 0})
+        total_a = stats["total"]
+        correct_a = stats["correct"]
+        accuracy = correct_a / total_a if total_a > 0 else 0.0
+
         items.append(
             MasteryItem(
-                knowledge_node_id=r.get("knowledge_node_id", ""),
-                total_attempts=r.get("total_attempts", 0),
-                correct_attempts=r.get("correct_attempts", 0),
-                accuracy=round(
-                    r.get("correct_attempts", 0) / r.get("total_attempts", 1)
-                    if r.get("total_attempts", 0) > 0
-                    else 0.0,
-                    3,
-                ),
-                last_attempt_at=r.get("last_attempt_at"),
+                kp_id=kp_id,
+                title=kp.get("title", ""),
+                mastery_level=kp.get("mastery_level", 0.0),
+                total_attempts=total_a,
+                correct_attempts=correct_a,
+                accuracy=round(accuracy, 3),
             ).model_dump()
         )
-        # 附加 SM-2 详情（MasteryItem schema 之外）
-        items[-1]["mastery_level"] = r.get("mastery_level", 0.0)
-        items[-1]["state"] = r.get("state", "new")
-        items[-1]["sm2_next_review"] = r.get("sm2_next_review")
-        items[-1]["sm2_interval_days"] = r.get("sm2_interval_days", 0)
 
     if not items:
         return APIResponse(
-            data={
-                "student_id": student_id,
-                "items": [],
-            },
-            message="暂无掌握度数据。完成一次测验后即可查看。",
+            data={"student_id": student_id, "items": []},
+            message="暂无知识点数据。请先上传教材并完成解析。",
         )
 
     return APIResponse(
@@ -172,24 +187,24 @@ async def get_wrong_questions(
 ) -> APIResponse:
     """获取学生错题本。
 
-    从 ``quiz_attempts`` 表中查询 ``student_id`` 匹配且 ``is_correct=0``
-    的记录，按提交时间倒序排列。
+    从 wrong_questions 表直接查询，按收录时间倒序排列。
     """
-    rows, total = await db.list_attempts_by_student(
-        student_id, is_correct=False, limit=limit, offset=offset
+    rows, total = await db.list_wrong_questions_by_student(
+        student_id, limit=limit, offset=offset
     )
 
     items: list[dict] = []
     for row in rows:
         items.append(
             WrongQuestionItem(
-                attempt_id=row["attempt_id"],
+                wrong_id=row["wrong_id"],
                 question_id=row["question_id"],
-                student_answer=row["student_answer"],
-                is_correct=False,
-                score=row["score"],
-                submitted_at=row["submitted_at"],
-                note=row["note"],
+                kp_id=row.get("kp_id", ""),
+                wrong_answer=row.get("wrong_answer"),
+                correct_answer=row.get("correct_answer", ""),
+                attempt_count=row.get("attempt_count", 1),
+                resolution_status=row.get("resolution_status", "unresolved"),
+                last_wrong_at=row.get("updated_at"),
             ).model_dump()
         )
 
@@ -216,7 +231,7 @@ async def get_today_plan(
 ) -> APIResponse:
     """获取学生今日复习清单。
 
-    查询 review_items 表，返回今天应完成的所有条目。
+    从 study_plans 表的 kp_sequence JSON 中筛选当天条目。
     """
     today = date.today().isoformat()
     items = await db.get_today_items(student_id, today)
@@ -235,11 +250,11 @@ async def get_today_plan(
             date=today,
             items=[
                 {
-                    "item_id": it["item_id"],
-                    "knowledge_node_id": it["knowledge_node_id"],
-                    "activity_type": it["activity_type"],
-                    "scheduled_date": it["scheduled_date"],
-                    "estimated_minutes": it["estimated_minutes"],
+                    "item_id": it.get("item_id", ""),
+                    "knowledge_node_id": it.get("knowledge_node_id", ""),
+                    "activity_type": it.get("activity_type", ""),
+                    "scheduled_date": it.get("scheduled_date", ""),
+                    "estimated_minutes": it.get("estimated_minutes", 0),
                     "completed": bool(it.get("completed", False)),
                     "notes": it.get("notes", ""),
                 }
@@ -250,19 +265,23 @@ async def get_today_plan(
 
 
 @router.post(
-    "/{student_id}/plan/items/{item_id}/toggle",
+    "/{student_id}/plan/items/{plan_id}/toggle",
     response_model=APIResponse,
 )
 async def toggle_plan_item(
     student_id: str,
-    item_id: str,
+    plan_id: str,
     body: dict[str, Any] = Body(...),
     db: Database = Depends(use_db),
 ) -> APIResponse:
-    """切换复习计划条目的完成状态。"""
+    """切换复习计划条目的完成状态。
+
+    Body: {"item_index": 0, "completed": true}
+    """
     completed = body.get("completed", False)
-    await db.update_review_item(item_id, {"completed": bool(completed)})
+    item_index = body.get("item_index", 0)
+    await db.update_kp_sequence_item(plan_id, item_index, {"completed": bool(completed)})
     return APIResponse(
-        data={"item_id": item_id, "completed": bool(completed)},
+        data={"plan_id": plan_id, "item_index": item_index, "completed": bool(completed)},
         message="ok",
     )

@@ -6,9 +6,8 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
+from datetime import date
 from typing import Any, Optional
-from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
@@ -44,11 +43,7 @@ class ErrorDetail(BaseModel):
 
 
 class MaterialUploadRequest(BaseModel):
-    """上传学习材料的请求体。
-
-    MVP 阶段接收原始文本而非 PDF 文件流，
-    待 PyMuPDF 集成后增加 file upload 支持。
-    """
+    """上传学习材料的请求体。"""
 
     title: str = Field(
         ...,
@@ -61,9 +56,9 @@ class MaterialUploadRequest(BaseModel):
         min_length=1,
         description="材料正文（PDF 提取后的文本或 Markdown）",
     )
-    subject: str = Field(
+    course_type: str = Field(
         default="",
-        description="所属学科，如'物理'、'数学'",
+        description="课程类型，如'physics'、'mathematics'",
     )
     description: str = Field(
         default="",
@@ -78,31 +73,26 @@ class MaterialStatusResponse(BaseModel):
     material_id: str = Field(..., description="材料唯一标识")
     title: str = Field(..., description="材料标题")
     status: str = Field(..., description="处理状态：draft / processing / ready")
-    chunk_count: int = Field(default=0, description="已解析的知识片段数量")
-    subject: str = Field(default="", description="学科")
+    kp_count: int = Field(default=0, description="已解析的知识点数量")
+    course_type: str = Field(default="", description="课程类型")
     created_at: str = Field(default="", description="创建时间 (ISO 8601)")
 
 
 # ============================================================================
-# Quiz Sessions（测验会话）
+# Quiz（测验）
 # ============================================================================
 
 
-class CreateSessionRequest(BaseModel):
-    """创建测验会话的请求体。"""
+class CreateQuizRequest(BaseModel):
+    """创建测验（生成题目）的请求体。"""
 
-    material_id: str = Field(
+    kp_ids: list[str] = Field(
         ...,
         min_length=1,
-        description="关联的学习材料 ID",
+        description="要考查的知识点 ID 列表",
     )
-    title: str = Field(
-        default="新测验",
-        max_length=256,
-        description="测验标题",
-    )
-    question_count: int = Field(
-        default=10,
+    count: int = Field(
+        default=5,
         ge=1,
         le=50,
         description="期望生成的题目数量",
@@ -111,21 +101,14 @@ class CreateSessionRequest(BaseModel):
         default="medium",
         description="整体难度：beginner / easy / medium / hard / expert",
     )
-    student_id: Optional[str] = Field(
+    types: Optional[list[str]] = Field(
         default=None,
-        description="作答学生 ID（匿名模式下为空）",
+        description="题型过滤，不传则覆盖全部题型",
     )
-
-
-class SessionResponse(BaseModel):
-    """测验会话状态响应。"""
-
-    session_id: str = Field(..., description="会话唯一标识")
-    material_id: str = Field(..., description="关联的材料 ID")
-    title: str = Field(..., description="测验标题")
-    state: str = Field(..., description="Orchestrator 工作流状态")
-    quiz_status: str = Field(default="draft", description="测验生命周期状态")
-    question_count: int = Field(default=0, description="已生成题目数量")
+    student_id: str = Field(
+        default="default",
+        description="学生标识",
+    )
 
 
 class AnswerItem(BaseModel):
@@ -134,11 +117,6 @@ class AnswerItem(BaseModel):
     question_id: str = Field(..., description="题目 ID")
     student_answer: Any = Field(..., description="学生提交的答案")
     time_spent_seconds: int = Field(default=0, ge=0, description="本题耗时（秒）")
-    hints_used: int = Field(default=0, ge=0, description="使用提示次数")
-    attempt_number: int = Field(default=1, ge=1, description="第几次尝试")
-    confidence: Optional[float] = Field(
-        default=None, ge=0.0, le=1.0, description="自评置信度"
-    )
 
 
 class SubmitAnswersRequest(BaseModel):
@@ -148,6 +126,10 @@ class SubmitAnswersRequest(BaseModel):
         ...,
         min_length=1,
         description="作答列表",
+    )
+    student_id: str = Field(
+        default="default",
+        description="学生标识",
     )
 
 
@@ -159,6 +141,7 @@ class QuestionResponse(BaseModel):
     type: str = Field(..., description="题目类型")
     difficulty: str = Field(..., description="难度等级")
     topic: str = Field(default="", description="主题标签")
+    kp_id: str = Field(default="", description="关联知识点 ID")
     options: list[dict[str, Any]] = Field(
         default_factory=list, description="选项列表"
     )
@@ -169,42 +152,27 @@ class QuestionResponse(BaseModel):
     estimated_seconds: int = Field(default=120, description="预计耗时（秒）")
 
 
-class ResultResponse(BaseModel):
-    """批改结果响应。"""
+class AttemptResponse(BaseModel):
+    """单题批改结果。"""
 
-    session_id: str = Field(..., description="会话 ID")
-    state: str = Field(..., description="当前工作流状态")
+    attempt_id: str = Field(..., description="作答记录 ID")
+    question_id: str = Field(..., description="题目 ID")
+    kp_id: str = Field(default="", description="知识点 ID")
+    student_answer: Any = Field(default=None, description="学生答案")
+    is_correct: Optional[bool] = Field(default=None, description="是否正确")
+    time_spent_seconds: int = Field(default=0, description="耗时（秒）")
+
+
+class QuizResultResponse(BaseModel):
+    """测验批改结果响应。"""
+
+    quiz_id: str = Field(default="", description="测验标识")
     attempts: list[dict[str, Any]] = Field(
         default_factory=list, description="逐题批改结果"
     )
-    misconceptions: list[dict[str, Any]] = Field(
-        default_factory=list, description="迷思概念诊断"
-    )
-    socratic_hints: list[dict[str, Any]] = Field(
-        default_factory=list, description="苏格拉底式渐进提示 (F8)"
-    )
-    summary: dict[str, Any] = Field(
-        default_factory=dict, description="评估汇总"
-    )
-
-
-class PlanResponse(BaseModel):
-    """学习计划响应。"""
-
-    session_id: str = Field(..., description="会话 ID")
-    state: str = Field(..., description="当前工作流状态")
-    plan_items: list[dict[str, Any]] = Field(
-        default_factory=list, description="排期条目列表"
-    )
-    summary: str = Field(default="", description="计划概述")
-
-
-class SubmitAnswersResponse(BaseModel):
-    """提交作答的确认响应。"""
-
-    session_id: str = Field(..., description="会话 ID")
-    accepted_count: int = Field(..., description="成功接收的作答条数")
-    state: str = Field(..., description="提交后的工作流状态")
+    correct_count: int = Field(default=0, description="正确数")
+    total_count: int = Field(default=0, description="总题数")
+    accuracy: float = Field(default=0.0, description="正确率 (0-1)")
 
 
 # ============================================================================
@@ -233,25 +201,25 @@ class DashboardResponse(BaseModel):
 class MasteryItem(BaseModel):
     """单个知识点的掌握度概览。"""
 
-    knowledge_node_id: str = Field(..., description="知识点 ID")
+    kp_id: str = Field(..., description="知识点 ID")
+    title: str = Field(default="", description="知识点标题")
+    mastery_level: float = Field(default=0.0, description="掌握度 (0-1)")
     total_attempts: int = Field(default=0, description="作答次数")
     correct_attempts: int = Field(default=0, description="正确次数")
     accuracy: float = Field(default=0.0, description="正确率 (0-1)")
-    last_attempt_at: Optional[str] = Field(
-        default=None, description="最近作答时间"
-    )
 
 
 class WrongQuestionItem(BaseModel):
     """错题本条目。"""
 
-    attempt_id: str = Field(..., description="作答记录 ID")
+    wrong_id: str = Field(..., description="错题记录 ID")
     question_id: str = Field(..., description="题目 ID")
-    student_answer: Any = Field(default=None, description="学生的错误答案")
-    is_correct: bool = Field(default=False, description="是否正确")
-    score: Optional[float] = Field(default=None, description="得分")
-    submitted_at: Optional[str] = Field(default=None, description="提交时间")
-    note: str = Field(default="", description="批注")
+    kp_id: str = Field(default="", description="知识点 ID")
+    wrong_answer: Optional[str] = Field(default=None, description="学生的错误答案")
+    correct_answer: str = Field(default="", description="正确答案")
+    attempt_count: int = Field(default=1, description="累计答错次数")
+    resolution_status: str = Field(default="unresolved", description="解决状态")
+    last_wrong_at: Optional[str] = Field(default=None, description="最近答错时间")
 
 
 class PlanTodayResponse(BaseModel):
@@ -263,27 +231,4 @@ class PlanTodayResponse(BaseModel):
     )
     items: list[dict[str, Any]] = Field(
         default_factory=list, description="今日排期条目"
-    )
-
-
-# ============================================================================
-# Tokens（用量统计）
-# ============================================================================
-
-
-class TokenStatsResponse(BaseModel):
-    """Token 用量统计响应。"""
-
-    total_prompt_tokens: int = Field(default=0, description="累计 Prompt Token")
-    total_completion_tokens: int = Field(default=0, description="累计 Completion Token")
-    total_tokens: int = Field(default=0, description="累计 Token")
-    call_count: int = Field(default=0, description="API 调用次数")
-    by_role: dict[str, Any] = Field(
-        default_factory=dict, description="按角色分组的 Token 用量（含 prompt/completion/total）"
-    )
-    budget: int = Field(default=0, description="Token 预算上限")
-    used: int = Field(default=0, description="已消耗 Token 数")
-    remaining: int = Field(default=0, description="剩余可用 Token 数")
-    by_tier: dict[str, Any] = Field(
-        default_factory=dict, description="按算力档位分组的 Token 用量"
     )

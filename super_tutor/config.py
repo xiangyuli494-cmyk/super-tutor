@@ -3,36 +3,52 @@
 Reads settings from ~/.super-tutor/settings.json with env-var override (TUTOR_ prefix).
 """
 
+from __future__ import annotations
+
 import json
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 
+@dataclass
 class TutorConfig:
-    """Super Tutor 单例配置管理器。
+    """Super Tutor 配置。
 
     Attributes:
-        deepseek_api_key: DeepSeek API 密钥。
-        deepseek_base_url: DeepSeek API 基础 URL。
-        token_budget_default: 默认 Token 预算。
+        api_key: API 密钥。
+        api_base_url: API 基础 URL。
+        db_path: SQLite 数据库文件路径。
+        model: 默认模型名称。
+        max_retries: 最大重试次数。
+        request_timeout: 请求超时（秒）。
     """
 
-    _instance: Optional["TutorConfig"] = None
+    api_key: str = ""
+    api_base_url: str = "https://api.deepseek.com"
+    db_path: str = "~/.super-tutor/super_tutor.db"
+    model: str = "deepseek-chat"
+    max_retries: int = 3
+    request_timeout: int = 120
 
-    def __init__(self) -> None:
-        self.deepseek_api_key: str = ""
-        self.deepseek_base_url: str = "https://api.deepseek.com"
-        self.token_budget_default: int = 1_000_000
-
-        self._load_from_file()
-        self._apply_env_overrides()
+    # ------------------------------------------------------------------
+    # Factory: load from file + env
+    # ------------------------------------------------------------------
 
     @classmethod
-    def get_instance(cls) -> "TutorConfig":
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
+    def load(cls) -> TutorConfig:
+        """从 settings.json 和环境变量加载配置。
+
+        优先级：环境变量 > settings.json > 默认值。
+        """
+        config = cls()
+        config._load_from_file()
+        config._apply_env_overrides()
+        return config
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
 
     def _settings_path(self) -> Path:
         return Path.home() / ".super-tutor" / "settings.json"
@@ -48,46 +64,34 @@ class TutorConfig:
         if not isinstance(data, dict):
             return
 
-        self.deepseek_api_key = data.get("deepseek_api_key", self.deepseek_api_key)
-        self.deepseek_base_url = data.get("deepseek_base_url", self.deepseek_base_url)
-        self.token_budget_default = data.get("token_budget_default", self.token_budget_default)
+        # Map settings.json keys → dataclass fields
+        _FILE_KEY_MAP = {
+            "deepseek_api_key": "api_key",
+            "deepseek_base_url": "api_base_url",
+            "api_key": "api_key",
+            "api_base_url": "api_base_url",
+            "db_path": "db_path",
+            "model": "model",
+            "max_retries": "max_retries",
+            "request_timeout": "request_timeout",
+        }
+        for file_key, attr in _FILE_KEY_MAP.items():
+            if file_key in data:
+                setattr(self, attr, data[file_key])
 
     def _apply_env_overrides(self) -> None:
-        for env_var, attr in [
-            ("TUTOR_API_KEY", "deepseek_api_key"),
-            ("TUTOR_API_BASE_URL", "deepseek_base_url"),
-            ("TUTOR_TOKEN_BUDGET", "token_budget_default"),
-        ]:
+        _ENV_MAP = {
+            "TUTOR_API_KEY": ("api_key", str),
+            "TUTOR_API_BASE_URL": ("api_base_url", str),
+            "TUTOR_DB_PATH": ("db_path", str),
+            "TUTOR_MODEL": ("model", str),
+            "TUTOR_MAX_RETRIES": ("max_retries", int),
+            "TUTOR_REQUEST_TIMEOUT": ("request_timeout", int),
+        }
+        for env_var, (attr, cast) in _ENV_MAP.items():
             value = os.environ.get(env_var)
             if value is not None:
-                if attr == "token_budget_default":
-                    try:
-                        setattr(self, attr, int(value))
-                    except ValueError:
-                        pass
-                else:
-                    setattr(self, attr, value)
-
-    @property
-    def api_key(self) -> str:
-        return self.deepseek_api_key
-
-    @property
-    def api_base_url(self) -> str:
-        return self.deepseek_base_url
-
-    @property
-    def model_heavy(self) -> str | None:
-        return None
-
-    @property
-    def model_medium(self) -> str | None:
-        return None
-
-    @property
-    def model_light(self) -> str | None:
-        return None
-
-    @classmethod
-    def reset(cls) -> None:
-        cls._instance = None
+                try:
+                    setattr(self, attr, cast(value))
+                except (ValueError, TypeError):
+                    pass

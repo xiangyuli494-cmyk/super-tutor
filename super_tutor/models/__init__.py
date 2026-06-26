@@ -4,11 +4,10 @@
 """
 
 from super_tutor.models.enums import (
-    AIRole,
+    CourseType,
     DifficultyLevel,
+    PlanStatus,
     QuestionType,
-    QuizStatus,
-    PipelinePhase,
 )
 
 from super_tutor.models.knowledge import (
@@ -16,46 +15,50 @@ from super_tutor.models.knowledge import (
     KnowledgeEdge,
     KnowledgeGraph,
     KnowledgeNode,
+    KnowledgePoint,
     Material,
 )
 
 from super_tutor.models.quiz import (
-    MisconceptionTag,
     Question,
     QuizAttempt,
-    QuizSession,
-    SocraticHint,
+    WrongQuestion,
 )
 
-from super_tutor.models.mastery import (
-    MasteryRecord,
-    ReviewItem,
-    StudentProfile,
-    StudyPlan,
+from super_tutor.models.assessment import (
+    AssessmentReport,
+    KPAssessmentResult,
 )
+
+from super_tutor.models.mastery import ReviewItem
+
+from super_tutor.models.plan import StudyPlan
+
+from super_tutor.models.socratic import SocraticTurn
 
 __all__ = [
     # Enums
-    "AIRole",
+    "CourseType",
     "DifficultyLevel",
+    "PlanStatus",
     "QuestionType",
-    "QuizStatus",
-    "PipelinePhase",
     # Knowledge
     "KnowledgeChunk",
     "KnowledgeEdge",
     "KnowledgeGraph",
     "KnowledgeNode",
+    "KnowledgePoint",
     "Material",
     # Quiz
-    "MisconceptionTag",
     "Question",
     "QuizAttempt",
-    "QuizSession",
-    "SocraticHint",
+    "WrongQuestion",
+    # Assessment
+    "AssessmentReport",
+    "KPAssessmentResult",
     # Mastery
-    "MasteryRecord",
     "ReviewItem",
-    "StudentProfile",
     "StudyPlan",
+    # Socratic
+    "SocraticTurn",
 ]

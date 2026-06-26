@@ -1,46 +1,34 @@
-"""Super Tutor — 测验会话路由。
+"""Super Tutor — 测验路由。
 
-核心路由文件，覆盖测验全生命周期：
-创建 → 获取题目 → 提交作答 → 查看结果 → 生成复习计划。
+直接调用 QuizEngine 完成题目生成、自动批改与错题收录。
+不再依赖 Orchestrator 状态机。
 """
 
 from __future__ import annotations
 
-import json as _json
 import logging
-from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from super_tutor.core.database import Database
-from super_tutor.core.exceptions import TutorError
 from super_tutor.core.llm_client import LLMClient
-from super_tutor.core.orchestrator import Orchestrator, OrchestratorError
-from super_tutor.core.role_manager import RoleManager
-from super_tutor.core.token_tracker import TokenTracker
-from super_tutor.routes.dependencies import (
-    OrchestratorRegistry,
-    build_orchestrator,
-    use_db,
-    use_llm_client,
-    use_orchestrator_registry,
-    use_role_manager,
-    use_token_tracker,
-)
+from super_tutor.engine.knowledge_engine import KnowledgeEngine
+from super_tutor.engine.quiz_engine import QuizEngine
+from super_tutor.routes.deps import use_db, use_llm_client
+from super_tutor.models.enums import DifficultyLevel, QuestionType
+from super_tutor.models.quiz import Question
 from super_tutor.routes.schemas import (
     APIResponse,
-    CreateSessionRequest,
-    PlanResponse,
+    AttemptResponse,
+    CreateQuizRequest,
     QuestionResponse,
-    ResultResponse,
-    SessionResponse,
+    QuizResultResponse,
     SubmitAnswersRequest,
-    SubmitAnswersResponse,
 )
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/v1/sessions", tags=["quizzes"])
+router = APIRouter(prefix="/api/v1/quizzes", tags=["quizzes"])
 
 
 # ===================================================================
@@ -48,479 +36,241 @@ router = APIRouter(prefix="/api/v1/sessions", tags=["quizzes"])
 # ===================================================================
 
 
-async def _get_orch(
-    session_id: str,
-    registry: OrchestratorRegistry,
-    db: Database,
-    llm: LLMClient,
-    roles: RoleManager,
-) -> Orchestrator:
-    """查询 Orchestrator：先查内存注册表，未命中则从 DB 恢复。
+def _build_quiz_engine(db: Database, llm: LLMClient) -> QuizEngine:
+    """Construct a QuizEngine with a KnowledgeEngine wired in."""
+    knowledge_engine = KnowledgeEngine(db=db, llm_client=llm)
+    return QuizEngine(db=db, llm_client=llm, knowledge_engine=knowledge_engine)
 
-    服务重启后内存注册表为空，但 session 数据仍在 DB 中。
-    本函数自动检测并恢复，确保会话在重启后仍然可用。
-    """
-    # ① 快速路径：内存命中
-    orch = registry.get(session_id)
-    if orch is not None:
-        return orch
 
-    # ② 慢速路径：从 DB 恢复（服务重启后）
-    orch = await Orchestrator.restore(
-        session_id,
-        database=db,
-        llm_client=llm,
-        role_manager=roles,
-    )
-    if orch is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"会话不存在或已过期：{session_id}",
-        )
-    registry[session_id] = orch
-    logger.info("会话 %s 已从数据库自动恢复（phase=%s）。", session_id, orch.state.value)
-    return orch
+def _strip_correct_answer(q: Question) -> dict:
+    """Convert a Question to a safe dict (no correct answer)."""
+    return QuestionResponse(
+        question_id=q.question_id,
+        stem=q.stem,
+        type=q.type.value,
+        difficulty=q.difficulty.value,
+        topic=q.topic,
+        kp_id=q.kp_id,
+        options=q.options,
+        hints=q.hints,
+        points=q.points,
+        estimated_seconds=q.estimated_seconds,
+    ).model_dump()
 
 
 # ===================================================================
-# Endpoints
+# POST /generate — 生成题目
 # ===================================================================
 
 
-@router.post("", response_model=APIResponse, status_code=201)
-async def create_session(
-    req: CreateSessionRequest,
+@router.post("/generate", response_model=APIResponse, status_code=201)
+async def generate_quiz(
+    req: CreateQuizRequest,
     db: Database = Depends(use_db),
     llm: LLMClient = Depends(use_llm_client),
-    roles: RoleManager = Depends(use_role_manager),
-    registry: OrchestratorRegistry = Depends(use_orchestrator_registry),
-    tracker: TokenTracker = Depends(use_token_tracker),
 ) -> APIResponse:
-    """创建测验会话。
+    """生成测验题目。
 
-    初始化一个新的 Orchestrator 实例，关联到指定的学习材料，
-    并注册到会话注册表中。后续通过 ``session_id`` 访问该会话。
+    根据指定的知识点、数量、难度和题型生成题目。
+    返回不含正确答案的题目列表（防止前端抓包作弊）。
     """
-    # 验证材料存在
-    material = await db.get_material(req.material_id)
-    if material is None:
-        raise HTTPException(
-            status_code=404,
-            detail=f"学习材料不存在：{req.material_id}",
-        )
+    quiz_engine = _build_quiz_engine(db, llm)
 
-    session_id = str(uuid4())
-
-    orch = build_orchestrator(
-        db=db, llm_client=llm, role_manager=roles, token_tracker=tracker,
-    )
-    await orch.initialize(
-        session_context={
-            "material_id": req.material_id,
-            "session_id": session_id,
-            "student_id": req.student_id,
-            "question_count": req.question_count,
-            "difficulty": req.difficulty,
-        }
-    )
-
-    registry[session_id] = orch
-
-    # 立即持久化初始 IDLE 状态（确保服务重启后可恢复）
-    await orch.save()
-
-    logger.info(
-        "Session created: id=%s material=%s title=%r",
-        session_id,
-        req.material_id,
-        req.title,
-    )
-
-    return APIResponse(
-        data=SessionResponse(
-            session_id=session_id,
-            material_id=req.material_id,
-            title=req.title,
-            state=orch.state.value,
-            quiz_status=orch._quiz_status,
-            question_count=0,
-        ).model_dump()
-    )
-
-
-@router.get("/{session_id}/questions", response_model=APIResponse)
-async def get_questions(
-    session_id: str,
-    registry: OrchestratorRegistry = Depends(use_orchestrator_registry),
-    db: Database = Depends(use_db),
-    llm: LLMClient = Depends(use_llm_client),
-    roles: RoleManager = Depends(use_role_manager),
-) -> APIResponse:
-    """获取测验题目列表。
-
-    首次调用时自动触发 PDF 解析与题目生成（IDLE → PARSING → QUIZ_GEN）。
-    后续调用直接返回已缓存的题目（优先从 DB 读取，避免重复消耗 Token）。
-
-    返回的题目**不含正确答案**，确保前端无法通过抓包作弊。
-    """
-    orch = await _get_orch(session_id, registry, db, llm, roles)
-
-    from super_tutor.models.enums import PipelinePhase
-
-    # ① 优先从 DB 读取已有题目（避免重复消耗 Token）
-    questions_from_db = await db.list_questions_by_session(session_id)
-    if questions_from_db:
-        # 确保 orchestrator 状态一致（至少有题目可用）
-        if orch.state == PipelinePhase.IDLE:
-            orch._phase = PipelinePhase.QUIZ_GEN
-        safe_questions: list[dict] = []
-        for q in questions_from_db:
-            options_raw = q.get("options", "[]")
-            if isinstance(options_raw, str):
-                try:
-                    options = _json.loads(options_raw)
-                except (_json.JSONDecodeError, TypeError):
-                    options = []
-            else:
-                options = options_raw
-            safe_questions.append(
-                QuestionResponse(
-                    question_id=q["question_id"],
-                    stem=q["stem"],
-                    type=q.get("type", "multiple_choice"),
-                    difficulty=q.get("difficulty", "medium"),
-                    topic=q.get("topic", ""),
-                    options=options,
-                    hints=[],
-                    points=q.get("points", 1.0),
-                    estimated_seconds=q.get("estimated_seconds", 120),
-                ).model_dump()
-            )
-        orch._quiz_status = "in_progress"  # 学生已开始查看题目
-        return APIResponse(
-            data={
-                "session_id": session_id,
-                "state": orch.state.value,
-                "quiz_status": orch._quiz_status,
-                "question_count": len(safe_questions),
-                "questions": safe_questions,
-            }
-        )
-
-    # ② 无 DB 缓存 → 触发流水线生成题目
     try:
-        if orch.state == PipelinePhase.IDLE:
-            await orch.start()  # IDLE → PARSING
-            await orch.proceed()  # PARSING → QUIZ_GEN
-        elif orch.state == PipelinePhase.PARSING:
-            await orch.proceed()  # PARSING → QUIZ_GEN
-        elif orch.state not in (
-            PipelinePhase.QUIZ_GEN,
-            PipelinePhase.EVALUATING,
-            PipelinePhase.PLANNING,
-        ):
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"当前状态 '{orch.state.value}' 不支持获取题目。"
-                    "请等待解析完成或创建新会话。"
-                ),
-            )
-    except TutorError as exc:
-        logger.exception("Quiz generation failed for session=%s", session_id)
-        raise HTTPException(
-            status_code=500,
-            detail=f"题目生成失败：{exc}",
-        ) from exc
-
-    # ③ 从内存 artifacts 提取题目（去掉正确答案）
-    raw_questions: list[dict] = orch._artifacts.get("questions", [])
-    safe_questions = []
-    for q in raw_questions:
-        safe_questions.append(
-            QuestionResponse(
-                question_id=q.get("question_id", ""),
-                stem=q.get("stem", ""),
-                type=q.get("type", "multiple_choice"),
-                difficulty=q.get("difficulty", "medium"),
-                topic=q.get("topic", ""),
-                options=q.get("options", []),
-                hints=q.get("hints", []),
-                points=q.get("points", 1.0),
-                estimated_seconds=q.get("estimated_seconds", 120),
-            ).model_dump()
+        questions = await quiz_engine.generate_questions(
+            kp_ids=req.kp_ids,
+            count=req.count,
+            difficulty=req.difficulty,
+            types=req.types,
         )
+    except Exception as exc:
+        logger.exception("Question generation failed")
+        raise HTTPException(status_code=500, detail=f"题目生成失败: {exc}") from exc
 
-    orch._quiz_status = "in_progress"  # 学生已开始查看题目
+    safe_questions = [_strip_correct_answer(q) for q in questions]
+
     return APIResponse(
         data={
-            "session_id": session_id,
-            "state": orch.state.value,
-            "quiz_status": orch._quiz_status,
-            "question_count": len(safe_questions),
+            "count": len(safe_questions),
             "questions": safe_questions,
         }
     )
 
 
-@router.post("/{session_id}/answers", response_model=APIResponse)
-async def submit_answers(
-    session_id: str,
+# ===================================================================
+# POST /grade — 提交作答并批改
+# ===================================================================
+
+
+@router.post("/grade", response_model=APIResponse)
+async def grade_answers(
     req: SubmitAnswersRequest,
-    registry: OrchestratorRegistry = Depends(use_orchestrator_registry),
     db: Database = Depends(use_db),
     llm: LLMClient = Depends(use_llm_client),
-    roles: RoleManager = Depends(use_role_manager),
 ) -> APIResponse:
-    """提交学生作答并自动触发批改。
+    """提交作答并自动批改。
 
-    将作答注入 Orchestrator，推进至 EVALUATING 阶段。
-    LLM 会逐题判定对错、打分，并诊断错题背后的迷思概念。
+    对选择题/判断题进行程序批改，其余题型送 LLM 批改。
+    错题自动录入错题本。
     """
-    orch = await _get_orch(session_id, registry, db, llm, roles)
+    quiz_engine = _build_quiz_engine(db, llm)
 
-    from super_tutor.models.enums import PipelinePhase
+    # -- Fetch question objects by IDs ------------------------------------
+    question_ids = [a.question_id for a in req.answers]
+    question_map = await db.get_questions_batch(question_ids)
 
-    if orch.state != PipelinePhase.QUIZ_GEN:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"当前状态 '{orch.state.value}' 不允许提交作答。"
-                f"需要 '{PipelinePhase.QUIZ_GEN.value}' 状态。"
-            ),
+    if not question_map:
+        raise HTTPException(status_code=404, detail="未找到对应题目。")
+
+    questions: list[Question] = []
+    for row in question_map.values():
+        options_raw = row.get("options", "[]")
+        if isinstance(options_raw, str):
+            import json as _json
+
+            try:
+                options = _json.loads(options_raw)
+            except (_json.JSONDecodeError, TypeError):
+                options = []
+        else:
+            options = options_raw
+
+        questions.append(
+            Question(
+                question_id=row["question_id"],
+                type=QuestionType(row.get("type", "multiple_choice")),
+                difficulty=DifficultyLevel(row.get("difficulty", "medium")),
+                subject=row.get("subject", ""),
+                topic=row.get("topic", ""),
+                stem=row.get("stem", ""),
+                options=options,
+                correct_answer=row.get("correct_answer", ""),
+                explanation=row.get("explanation", ""),
+                kp_id=row.get("kp_id", ""),
+                estimated_seconds=row.get("estimated_seconds", 120),
+                points=row.get("points", 1.0),
+                tags=[],
+            )
         )
 
-    # 从 session context 获取 student_id
-    student_id = orch._session_context.get("student_id", "")
-
-    # 反序列化作答并注入 student_id
-    answers = [
+    # -- Grade ------------------------------------------------------------
+    student_answers = [
         {
             "question_id": a.question_id,
             "student_answer": a.student_answer,
-            "student_id": student_id,
             "time_spent_seconds": a.time_spent_seconds,
-            "hints_used": a.hints_used,
-            "attempt_number": a.attempt_number,
-            "confidence": a.confidence,
         }
         for a in req.answers
     ]
 
     try:
-        accepted = await orch.submit_answers(answers, quiz_session_id=session_id)
-        await orch.proceed()  # QUIZ_GEN → EVALUATING
-    except TutorError as exc:
-        logger.exception("Answer submission failed for session=%s", session_id)
-        raise HTTPException(
-            status_code=500,
-            detail=f"作答提交或批改失败：{exc}",
-        ) from exc
-
-    logger.info(
-        "Answers submitted: session=%s accepted=%d/%d",
-        session_id,
-        accepted,
-        len(req.answers),
-    )
-
-    return APIResponse(
-        data=SubmitAnswersResponse(
-            session_id=session_id,
-            accepted_count=accepted,
-            state=orch.state.value,
-        ).model_dump()
-    )
-
-
-@router.get("/{session_id}/results", response_model=APIResponse)
-async def get_results(
-    session_id: str,
-    registry: OrchestratorRegistry = Depends(use_orchestrator_registry),
-    db: Database = Depends(use_db),
-    llm: LLMClient = Depends(use_llm_client),
-    roles: RoleManager = Depends(use_role_manager),
-) -> APIResponse:
-    """获取批改结果与迷思概念诊断。
-
-    需在提交作答后调用。返回逐题判定、得分、迷思概念标签及总体评估。
-    """
-    orch = await _get_orch(session_id, registry, db, llm, roles)
-
-    from super_tutor.models.enums import PipelinePhase
-
-    if orch.state not in (PipelinePhase.EVALUATING, PipelinePhase.PLANNING):
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"当前状态 '{orch.state.value}' 尚无批改结果。"
-                "请先提交作答（POST /sessions/{id}/answers）。"
-            ),
+        attempts = await quiz_engine.grade_answers(
+            questions=questions,
+            student_answers=student_answers,
+            student_id=req.student_id,
         )
+    except Exception as exc:
+        logger.exception("Grading failed")
+        raise HTTPException(status_code=500, detail=f"批改失败: {exc}") from exc
 
-    attempts = orch._artifacts.get("attempts", [])
-    misconceptions = orch._artifacts.get("misconceptions", [])
-    socratic_hints = orch._artifacts.get("socratic_hints", [])
-    summary = orch._artifacts.get("evaluating_summary", {})
+    # -- Add wrong answers to wrong book ----------------------------------
+    q_map = {q.question_id: q for q in questions}
+    wrong_count = 0
+    for attempt in attempts:
+        if attempt.is_correct is False:
+            try:
+                await quiz_engine.add_to_wrong_book(
+                    attempt, q_map.get(attempt.question_id)
+                )
+                wrong_count += 1
+            except Exception as exc:
+                logger.warning(
+                    "Failed to add wrong-book entry for %s: %s",
+                    attempt.attempt_id,
+                    exc,
+                )
 
-    # 向后兼容：若 summary 为空，尝试从原始 LLM 输出中提取
-    if not summary:
-        evaluating_output = orch._artifacts.get("evaluating_output", "")
-        if isinstance(evaluating_output, dict):
-            summary = evaluating_output.get("summary", {})
+    # -- Build response ---------------------------------------------------
+    correct_count = sum(1 for a in attempts if a.is_correct)
+    total = len(attempts)
 
-    return APIResponse(
-        data=ResultResponse(
-            session_id=session_id,
-            state=orch.state.value,
-            attempts=attempts,
-            misconceptions=misconceptions,
-            socratic_hints=socratic_hints,
-            summary=summary,
+    attempt_dicts = [
+        AttemptResponse(
+            attempt_id=a.attempt_id,
+            question_id=a.question_id,
+            kp_id=a.kp_id,
+            student_answer=a.student_answer,
+            is_correct=a.is_correct,
+            time_spent_seconds=a.time_spent_seconds,
         ).model_dump()
-    )
-
-
-@router.post("/{session_id}/plan", response_model=APIResponse)
-async def generate_plan(
-    session_id: str,
-    registry: OrchestratorRegistry = Depends(use_orchestrator_registry),
-    db: Database = Depends(use_db),
-    llm: LLMClient = Depends(use_llm_client),
-    roles: RoleManager = Depends(use_role_manager),
-) -> APIResponse:
-    """生成 SM-2 间隔重复复习计划。
-
-    基于批改结果和迷思概念诊断，由 Tutor 角色生成个性化排期。
-    每天学习量不超过 2 小时，薄弱知识点排在高优先级。
-    """
-    orch = await _get_orch(session_id, registry, db, llm, roles)
-
-    from super_tutor.models.enums import PipelinePhase
-
-    if orch.state == PipelinePhase.EVALUATING:
-        try:
-            await orch.proceed()  # EVALUATING → PLANNING
-        except TutorError as exc:
-            logger.exception("Plan generation failed for session=%s", session_id)
-            raise HTTPException(
-                status_code=500,
-                detail=f"排期计划生成失败：{exc}",
-            ) from exc
-    elif orch.state == PipelinePhase.PLANNING:
-        # 已经生成，直接返回
-        pass
-    else:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"当前状态 '{orch.state.value}' 不支持生成排期。"
-                "需要先完成批改（EVALUATING 状态）。"
-            ),
-        )
-
-    plan_items = orch._artifacts.get("plan_items", [])
-    planning_output = orch._artifacts.get("planning_output", "")
-    plan_summary = ""
-    if isinstance(planning_output, dict):
-        plan_summary = planning_output.get("summary", "")
+        for a in attempts
+    ]
 
     return APIResponse(
-        data=PlanResponse(
-            session_id=session_id,
-            state=orch.state.value,
-            plan_items=plan_items,
-            summary=plan_summary,
+        data=QuizResultResponse(
+            attempts=attempt_dicts,
+            correct_count=correct_count,
+            total_count=total,
+            accuracy=round(correct_count / total, 3) if total > 0 else 0.0,
         ).model_dump()
     )
 
 
 # ===================================================================
-# Session lifecycle — restore / resume / retry
+# GET /questions — 按 ID 批量查询题目（不含正确答案）
 # ===================================================================
 
 
-@router.post("/{session_id}/restore", response_model=APIResponse)
-async def restore_session(
-    session_id: str,
+@router.get("/questions", response_model=APIResponse)
+async def get_questions(
+    ids: str = "",
     db: Database = Depends(use_db),
-    llm: LLMClient = Depends(use_llm_client),
-    roles: RoleManager = Depends(use_role_manager),
-    registry: OrchestratorRegistry = Depends(use_orchestrator_registry),
 ) -> APIResponse:
-    """从数据库恢复一个已持久化的会话。
+    """按 ID 批量获取题目（不含正确答案）。
 
-    服务重启后使用，将 DB 中的会话重新加载到内存注册表。
-    若会话已在内存中，直接返回当前状态。
+    Query params:
+        ids: 逗号分隔的 question_id 列表
     """
-    # 已在内存中
-    orch = registry.get(session_id)
-    if orch is not None:
-        return APIResponse(
-            data={"session_id": session_id, "state": orch.state.value},
-            message="会话已在内存中，无需恢复。",
+    if not ids:
+        raise HTTPException(status_code=400, detail="请提供 ids 参数（逗号分隔的 question_id）。")
+
+    qids = [qid.strip() for qid in ids.split(",") if qid.strip()]
+    if not qids:
+        raise HTTPException(status_code=400, detail="ids 参数不能为空。")
+
+    q_map = await db.get_questions_batch(qids)
+
+    safe_questions: list[dict] = []
+    for row in q_map.values():
+        options_raw = row.get("options", "[]")
+        if isinstance(options_raw, str):
+            import json as _json
+
+            try:
+                options = _json.loads(options_raw)
+            except (_json.JSONDecodeError, TypeError):
+                options = []
+        else:
+            options = options_raw
+
+        safe_questions.append(
+            QuestionResponse(
+                question_id=row["question_id"],
+                stem=row.get("stem", ""),
+                type=row.get("type", "multiple_choice"),
+                difficulty=row.get("difficulty", "medium"),
+                topic=row.get("topic", ""),
+                kp_id=row.get("kp_id", ""),
+                options=options,
+                hints=[],
+                points=row.get("points", 1.0),
+                estimated_seconds=row.get("estimated_seconds", 120),
+            ).model_dump()
         )
 
-    orch = await Orchestrator.restore(
-        session_id, database=db, llm_client=llm, role_manager=roles,
-    )
-    if orch is None:
-        raise HTTPException(status_code=404, detail=f"会话不存在：{session_id}")
-
-    registry[session_id] = orch
-    logger.info("会话 %s 已从数据库手动恢复。", session_id)
-    return APIResponse(
-        data={"session_id": session_id, "state": orch.state.value},
-        message="会话已从数据库恢复。",
-    )
-
-
-@router.post("/{session_id}/resume", response_model=APIResponse)
-async def resume_session(
-    session_id: str,
-    registry: OrchestratorRegistry = Depends(use_orchestrator_registry),
-    db: Database = Depends(use_db),
-    llm: LLMClient = Depends(use_llm_client),
-    roles: RoleManager = Depends(use_role_manager),
-) -> APIResponse:
-    """恢复一个暂停的会话并从当前阶段继续。
-
-    仅当会话处于暂停状态（``_paused=True``）时可用。
-    """
-    orch = await _get_orch(session_id, registry, db, llm, roles)
-    try:
-        await orch.resume()
-    except OrchestratorError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
-    return APIResponse(
-        data={"session_id": session_id, "state": orch.state.value},
-        message="会话已恢复。",
-    )
-
-
-@router.post("/{session_id}/retry", response_model=APIResponse)
-async def retry_session_step(
-    session_id: str,
-    registry: OrchestratorRegistry = Depends(use_orchestrator_registry),
-    db: Database = Depends(use_db),
-    llm: LLMClient = Depends(use_llm_client),
-    roles: RoleManager = Depends(use_role_manager),
-) -> APIResponse:
-    """重试当前失败的步骤。
-
-    仅当会话处于错误状态（``_error_message is not None``）时可用。
-    连续重试上限为 ``_MAX_STEP_RETRIES``（3 次），超过后需人工介入。
-    """
-    orch = await _get_orch(session_id, registry, db, llm, roles)
-    try:
-        await orch.retry_step()
-    except OrchestratorError as exc:
-        raise HTTPException(status_code=409, detail=str(exc))
     return APIResponse(
         data={
-            "session_id": session_id,
-            "state": orch.state.value,
-            "error_message": orch._error_message,
-        },
-        message="步骤已重试。" if orch._error_message is None else "重试已达上限，请人工介入。",
+            "count": len(safe_questions),
+            "questions": safe_questions,
+        }
     )

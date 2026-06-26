@@ -6,25 +6,26 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from pathlib import Path
+from typing import AsyncIterator, Optional
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from slowapi import _rate_limit_exceeded_handler
-from slowapi.errors import RateLimitExceeded
+from starlette.datastructures import State as AppState
 
 from super_tutor import __version__
+from super_tutor.core.database import Database
 from super_tutor.core.exceptions import TutorError
-from super_tutor.core.limiter import limiter
+from super_tutor.core.llm_client import LLMClient
 from super_tutor.routes import (
     dashboard_router,
     materials_router,
     quizzes_router,
-    tokens_router,
 )
-from super_tutor.routes.dependencies import init_app_state, shutdown_app_state
+from super_tutor.routes.deps import _S_DB, _S_LLM
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -36,6 +37,68 @@ logging.basicConfig(
 )
 logger = logging.getLogger("super_tutor.main")
 
+
+# ===================================================================
+# Lifespan helpers
+# ===================================================================
+
+
+async def init_app_state(app_state: AppState) -> None:
+    """Initialize shared resources and attach them to ``app.state``.
+
+    Called once during FastAPI startup (inside the ``lifespan`` context
+    manager).  After this returns, every route can ``Depends(use_db)`` etc.
+    """
+    # -- Database -------------------------------------------------------
+    db_path = _resolve_db_path()
+    database = Database(db_path=db_path)
+    await database.initialize()
+    setattr(app_state, _S_DB, database)
+    logger.info("Database ready: %s", db_path)
+
+    # -- LLM Client -----------------------------------------------------
+    try:
+        llm_client = LLMClient()
+        setattr(app_state, _S_LLM, llm_client)
+        logger.info("LLM client ready.")
+    except Exception as exc:
+        logger.warning(
+            "LLM client unavailable (API key not configured?): %s. "
+            "LLM-dependent endpoints will return 503.",
+            exc,
+        )
+        setattr(app_state, _S_LLM, None)
+
+
+async def shutdown_app_state(app_state: AppState) -> None:
+    """Clean up shared resources on shutdown."""
+    db: Optional[Database] = getattr(app_state, _S_DB, None)
+    if db is not None:
+        await db.close()
+        logger.info("Database connection closed.")
+
+
+# ===================================================================
+# Internal helpers
+# ===================================================================
+
+
+def _resolve_db_path() -> str:
+    """Determine the default SQLite database path.
+
+    Priority:
+    1. ``TUTOR_DB_PATH`` environment variable.
+    2. ``~/.super-tutor/super_tutor.db`` in the user's home directory.
+    """
+    env_path = os.getenv("TUTOR_DB_PATH")
+    if env_path:
+        return str(Path(env_path).expanduser().resolve())
+
+    path = Path.home() / ".super-tutor" / "super_tutor.db"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -45,7 +108,7 @@ logger = logging.getLogger("super_tutor.main")
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """应用生命周期管理。
 
-    - 启动时：初始化 Database、LLMClient、RoleManager，挂载到 app.state。
+    - 启动时：初始化 Database、LLMClient，挂载到 app.state。
     - 关闭时：关闭数据库连接。
     """
     logger.info("Super Tutor v%s starting up...", __version__)
@@ -76,12 +139,6 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
-
-# ---------------------------------------------------------------------------
-# Rate Limiter — attach to app state + exception handler
-# ---------------------------------------------------------------------------
-app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ---------------------------------------------------------------------------
 # Middleware
@@ -149,20 +206,12 @@ async def generic_error_handler(request: Request, exc: Exception) -> JSONRespons
 
 @app.get("/api/v1/health")
 async def health_check(request: Request) -> dict:
-    """健康检查端点（含 prompt 版本信息）。"""
-    prompt_versions: dict = {}
-    try:
-        roles = getattr(request.app.state, "tutor_role_manager", None)
-        if roles is not None and hasattr(roles, "get_all_versions"):
-            prompt_versions = roles.get_all_versions()
-    except Exception:
-        pass
+    """健康检查端点。"""
     return {
         "code": 0,
         "message": "ok",
         "data": {
             "version": __version__,
-            "prompt_versions": prompt_versions,
         },
     }
 
@@ -174,7 +223,6 @@ async def health_check(request: Request) -> dict:
 app.include_router(materials_router)
 app.include_router(quizzes_router)
 app.include_router(dashboard_router)
-app.include_router(tokens_router)
 
 
 # ---------------------------------------------------------------------------

@@ -1,58 +1,63 @@
-"""Tests for material upload and status endpoints."""
+"""Tests for material CRUD operations — direct database level."""
 
 from __future__ import annotations
 
-from fastapi.testclient import TestClient
+from datetime import datetime, timezone
+
+from tests.conftest import _create_test_material
 
 
 class TestMaterials:
-    """Material API tests."""
+    """Material database operations."""
 
-    async def test_upload_text_material(self, client: TestClient):
-        """POST /api/v1/materials/upload — should create a material."""
-        resp = client.post("/api/v1/materials/upload", json={
-            "title": "大学物理·力学篇",
-            "content": "牛顿第一定律：物体在不受外力作用时，保持静止或匀速直线运动状态。\n牛顿第二定律：F=ma。\n牛顿第三定律：作用力与反作用力大小相等、方向相反。",
-            "subject": "物理",
-            "description": "牛顿三大定律基础材料",
+    async def test_create_material(self, test_db):
+        """create_material should insert and return the material_id."""
+        now = datetime.now(timezone.utc).isoformat()
+        mat_id = await test_db.create_material({
+            "material_id": "mat-test-1",
+            "title": "大学物理",
+            "content": "牛顿三大定律",
+            "course_type": "physics",
+            "status": "draft",
+            "created_at": now,
+            "updated_at": now,
         })
-        assert resp.status_code == 201, resp.text
-        data = resp.json()
-        assert data["code"] == 0
-        assert "material_id" in data["data"]
-        assert data["data"]["title"] == "大学物理·力学篇"
-        assert data["data"]["status"] != ""  # status field present
+        assert mat_id == "mat-test-1"
 
-    async def test_get_material_status(self, client: TestClient):
-        """GET /api/v1/materials/{id}/status — should return material info."""
-        # Upload first
-        upload_resp = client.post("/api/v1/materials/upload", json={
-            "title": "测试材料",
-            "content": "一些测试内容。",
-            "subject": "数学",
-        })
-        material_id = upload_resp.json()["data"]["material_id"]
+        row = await test_db.get_material("mat-test-1")
+        assert row is not None
+        assert row["title"] == "大学物理"
+        assert row["course_type"] == "physics"
 
-        # Query status
-        resp = client.get(f"/api/v1/materials/{material_id}/status")
-        assert resp.status_code == 200, resp.text
-        data = resp.json()
-        assert data["code"] == 0
-        assert data["data"]["material_id"] == material_id
-        assert data["data"]["title"] == "测试材料"
-        assert data["data"]["subject"] == "数学"
-        # Newly uploaded material should be in "draft" status
-        assert "status" in data["data"]
+    async def test_get_material_nonexistent(self, test_db):
+        """get_material should return None for unknown IDs."""
+        row = await test_db.get_material("nonexistent")
+        assert row is None
 
-    async def test_upload_empty_title(self, client: TestClient):
-        """POST /api/v1/materials/upload with empty title → 422."""
-        resp = client.post("/api/v1/materials/upload", json={
-            "title": "",
-            "content": "内容",
-        })
-        assert resp.status_code == 422, resp.text
+    async def test_list_materials(self, test_db):
+        """list_materials should return all materials."""
+        await _create_test_material(test_db, material_id="mat-a", title="A")
+        await _create_test_material(test_db, material_id="mat-b", title="B")
 
-    async def test_get_nonexistent_material(self, client: TestClient):
-        """GET /api/v1/materials/{id}/status with bad id → 404."""
-        resp = client.get("/api/v1/materials/nonexistent-id/status")
-        assert resp.status_code == 404, resp.text
+        mats = await test_db.list_materials()
+        assert len(mats) >= 2
+        titles = [m["title"] for m in mats]
+        assert "A" in titles
+        assert "B" in titles
+
+    async def test_get_material_returns_all_fields(self, test_db):
+        """get_material should return content, status, course_type."""
+        await _create_test_material(
+            test_db,
+            material_id="mat-full",
+            title="完整材料",
+            content="详细内容",
+            course_type="mathematics",
+            status="ready",
+        )
+
+        row = await test_db.get_material("mat-full")
+        assert row is not None
+        assert row["content"] == "详细内容"
+        assert row["course_type"] == "mathematics"
+        assert row["status"] == "ready"

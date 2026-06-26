@@ -1,22 +1,19 @@
 """Super Tutor — 材料管理路由。
 
 提供学习材料的上传（文本 / PDF 文件）与状态查询。
-PDF 文件通过 PyMuPDF 提取文本后存储，后续可由 Orchestrator
-在 PARSING 阶段读取完整文本送给 LLM 进行知识切片。
+PDF 文件通过 PyMuPDF 提取文本后存储。
 """
 
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 
 from super_tutor.core.database import Database
-from super_tutor.core.limiter import limiter
-from super_tutor.routes.dependencies import use_db
+from super_tutor.routes.deps import use_db
 from super_tutor.routes.schemas import (
     APIResponse,
     MaterialStatusResponse,
@@ -44,26 +41,19 @@ except ImportError:  # pragma: no cover
 
 
 @router.post("/upload", response_model=APIResponse, status_code=201)
-@limiter.limit("10/minute")
 async def upload_material(
-    request: Request,
     req: MaterialUploadRequest,
     db: Database = Depends(use_db),
 ) -> APIResponse:
     """上传学习材料（文本内容，JSON 格式）。
 
     接收已提取的纯文本或 Markdown，存入数据库供后续解析。
-    完整文本被保存（不截断），Orchestrator 在 PARSING 阶段
-    会读取全文送给 Tutor 角色进行知识切片。
-
-    如需直接上传 PDF 文件，请使用 ``POST /upload/file``。
     """
     return await _store_material(
         db=db,
         title=req.title,
         content=req.content,
-        subject=req.subject,
-        description=req.description,
+        course_type=req.course_type,
     )
 
 
@@ -73,24 +63,20 @@ async def upload_material(
 
 
 @router.post("/upload/file", response_model=APIResponse, status_code=201)
-@limiter.limit("5/minute")
 async def upload_material_file(
-    request: Request,
     file: UploadFile = File(..., description="PDF 教材文件（≤50MB）"),
     title: str = Form(..., description="材料标题"),
-    subject: str = Form(default="", description="所属学科"),
-    description: str = Form(default="", description="材料简介"),
+    course_type: str = Form(default="", description="课程类型"),
+    description: str = Form(default="", description="材料简介（已废弃，仅保留兼容）"),
     db: Database = Depends(use_db),
 ) -> APIResponse:
     """上传 PDF 教材文件，自动提取文本。
 
     使用 PyMuPDF 解析 PDF，提取全部页面文本后存入数据库。
-    后续 Orchestrator 在 PARSING 阶段会读取全文进行知识切片。
 
     限制：
     - 仅接受 ``application/pdf`` 格式
     - 文件大小 ≤ 50MB
-    - 扫描版 PDF（无文字层）的提取效果取决于 OCR 质量
     """
     # -- 格式校验 --------------------------------------------------------
     if file.content_type and file.content_type != "application/pdf":
@@ -99,12 +85,12 @@ async def upload_material_file(
             detail=f"不支持的文件格式 '{file.content_type}'，仅接受 PDF。",
         )
 
-    # -- 分块读取文件内容（避免大文件占满内存）---------------------------
+    # -- 分块读取文件内容 ------------------------------------------------
     try:
         chunks: list[bytes] = []
         total_read = 0
-        MAX_SIZE = 50 * 1024 * 1024  # 50MB 硬上限
-        CHUNK_SIZE = 1024 * 1024     # 1MB 分块
+        MAX_SIZE = 50 * 1024 * 1024
+        CHUNK_SIZE = 1024 * 1024
 
         while True:
             chunk = await file.read(CHUNK_SIZE)
@@ -114,7 +100,7 @@ async def upload_material_file(
             if total_read > MAX_SIZE:
                 raise HTTPException(
                     status_code=413,
-                    detail=f"文件过大（已超过 50MB 上限）。",
+                    detail="文件过大（已超过 50MB 上限）。",
                 )
             chunks.append(chunk)
 
@@ -175,8 +161,7 @@ async def upload_material_file(
         db=db,
         title=title,
         content=extracted_text,
-        subject=subject,
-        description=description,
+        course_type=course_type,
     )
 
 
@@ -192,25 +177,25 @@ async def get_material_status(
 ) -> APIResponse:
     """查询材料解析状态。
 
-    返回材料基本信息及已解析的知识片段数量。
+    返回材料基本信息及已解析的知识点数量。
     """
-    project = await db.get_material(material_id)
-    if project is None:
+    material = await db.get_material(material_id)
+    if material is None:
         raise HTTPException(
             status_code=404,
             detail=f"材料不存在：{material_id}",
         )
 
-    chunks = await db.list_chunks_by_material(material_id)
+    kps = await db.list_knowledge_points_by_material(material_id)
 
     return APIResponse(
         data=MaterialStatusResponse(
             material_id=material_id,
-            title=project.get("title", ""),
-            status=project.get("status", "unknown"),
-            chunk_count=len(chunks),
-            subject=project.get("subject", ""),
-            created_at=project.get("created_at", ""),
+            title=material.get("title", ""),
+            status=material.get("status", "unknown"),
+            kp_count=len(kps),
+            course_type=material.get("course_type", ""),
+            created_at=material.get("created_at", ""),
         ).model_dump()
     )
 
@@ -225,8 +210,7 @@ async def _store_material(
     db: Database,
     title: str,
     content: str,
-    subject: str,
-    description: str,
+    course_type: str,
 ) -> APIResponse:
     """存储材料到数据库（全文保存，不截断）。"""
     material_id = str(uuid4())
@@ -237,9 +221,8 @@ async def _store_material(
             {
                 "material_id": material_id,
                 "title": title,
-                "content": content,  # 全文存储，Orchestrator 解析时从此读取
-                "subject": subject,
-                "description": description,
+                "content": content,
+                "course_type": course_type,
                 "status": "draft",
                 "created_at": now,
                 "updated_at": now,
@@ -253,10 +236,10 @@ async def _store_material(
         ) from exc
 
     logger.info(
-        "Material stored: id=%s title=%r subject=%r chars=%d",
+        "Material stored: id=%s title=%r course_type=%r chars=%d",
         material_id,
         title,
-        subject,
+        course_type,
         len(content),
     )
 
@@ -264,8 +247,7 @@ async def _store_material(
         data={
             "material_id": material_id,
             "title": title,
-            "subject": subject,
-            "description": description,
+            "course_type": course_type,
             "content_length": len(content),
             "status": "draft",
             "created_at": now,
@@ -274,18 +256,7 @@ async def _store_material(
 
 
 def _extract_pdf_text(pdf_bytes: bytes, *, filename: str = "") -> str:
-    """使用 PyMuPDF 从 PDF 字节流中提取全部文字。
-
-    Args:
-        pdf_bytes: PDF 文件的原始字节。
-        filename: 文件名（仅用于日志）。
-
-    Returns:
-        提取的全量文本，页面间以换行分隔。
-
-    Raises:
-        ValueError: PDF 无法打开或已加密。
-    """
+    """使用 PyMuPDF 从 PDF 字节流中提取全部文字。"""
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
     if doc.is_encrypted:
@@ -299,7 +270,7 @@ def _extract_pdf_text(pdf_bytes: bytes, *, filename: str = "") -> str:
     pages_text: list[str] = []
     for page_num in range(doc.page_count):
         page = doc[page_num]
-        text = page.get_text("text")  # 纯文本模式
+        text = page.get_text("text")
         if text.strip():
             pages_text.append(text)
 
@@ -308,14 +279,12 @@ def _extract_pdf_text(pdf_bytes: bytes, *, filename: str = "") -> str:
     full_text = "\n\n".join(pages_text)
 
     if not full_text.strip():
-        # 尝试 textblock 模式（对某些布局更友好）
         doc2 = fitz.open(stream=pdf_bytes, filetype="pdf")
         pages_text2: list[str] = []
         for page_num in range(doc2.page_count):
             page = doc2[page_num]
             text = page.get_text("blocks")
             if text:
-                # blocks 返回 list[tuple]，提取其中的文本
                 block_texts = [
                     block[4] if isinstance(block, (tuple, list)) and len(block) > 4 else str(block)
                     for block in text
