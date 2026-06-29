@@ -345,7 +345,25 @@ def _resolve_successor_topics(kp, all_kps: list) -> str:
 
 
 def main() -> None:
-    """Streamlit entry point."""
+    """Streamlit 单页应用入口 — 完整的智能教学系统 UI 主循环。
+
+    执行顺序（自上而下的页面流）：
+    1. 页面配置 — ``st.set_page_config()`` 宽屏布局 + 标题
+    2. 服务惰性初始化 — ``_init_services()`` → DB + LLM + KnowledgeEngine
+       （仅在首次运行时执行，之后从 st.session_state 读取单例）
+    3. 📥 导入教材 — 双标签页（PDF 上传 / 文本粘贴）+ 课程类型 + 标题
+    4. 🔍 开始解析 — 调用 ``_do_parse()`` 提取知识点 → 存储到 session_state
+    5. 📋 知识点展示 — ``_render_knowledge_table()`` 表格展示 + 确认按钮
+    6. 确认后进入 4 标签页模式：
+       - 📝 练习答题 — QuizEngine 出题 + 混合批改
+       - 📖 错题本 — 错题分组展示 + 苏格拉底追问
+       - 🔬 诊断评估 — AssessmentEngine 诊断 + 3 条前置规则校准
+       - 📅 学习计划 — PlanEngine 拓扑排序 + 优先级排期
+
+    依赖的 20 个 session_state key 通过模块级常量引用
+    （_S_DB, _S_LLM, _S_ENGINE, _S_KPS, ...）。
+    所有业务逻辑委托给 engine/ 层的 5 个引擎。
+    """
     st.set_page_config(
         page_title="Super Tutor — 智能教学系统",
         page_icon="🎓",
