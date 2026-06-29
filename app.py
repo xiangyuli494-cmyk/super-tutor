@@ -1,10 +1,60 @@
-"""Super Tutor — Streamlit 上传与知识点解析页面。
+"""Super Tutor — Streamlit 前端入口（单页应用）。
 
-提供两种教材导入方式：
-1. 上传 PDF 文件（自动提取文本）
-2. 直接粘贴文本内容
+【功能说明】
+基于 Streamlit 构建的智能教学系统前端，提供以下完整用户流程：
 
-解析后的知识点以表格形式展示，包含主题、难度、前置/后继关系。
+1. 📥 导入教材 — 上传 PDF（PyPDF2 提取）或粘贴文本
+2. 🤖 AI 解析 — 调用 KnowledgeEngine 提取结构化知识点（含难度、前置/后继关系）
+3. 📋 知识点展示 — 以表格形式展示，支持预览和确认
+4. 📝 练习答题 — QuizEngine 出题 + 程序/LLM 混合批改
+5. 📖 错题本 — 自动收录错题，支持按知识点筛选 + 苏格拉底追问
+6. 🔬 诊断评估 — AssessmentEngine 生成诊断性题目 + 3 条前置规则校准
+7. 📅 学习计划 — PlanEngine 拓扑排序 + 优先级公式 + 日排期
+
+页面布局（layout="wide"）：
+┌────────────────────────────────────────────┐
+│ 🎓 Super Tutor — 智能教学系统               │
+│ ┌─ 📄 上传 PDF ──┬── ✏️ 粘贴文本 ────────┐ │
+│ │                 │                        │ │
+│ ├─ 课程类型 ─────┴── 教材标题 ────────────┤ │
+│ │                 [🔍 开始解析]            │ │
+│ └─────────────────────────────────────────┘ │
+│ ┌─ 📋 知识点列表 ─────────────────────────┐ │
+│ │ [确认，开始诊断评估 →] [🔄 重新上传]      │ │
+│ └─────────────────────────────────────────┘ │
+│ ┌─ Tab: 📝 练习答题 ─────────────────────┐ │
+│ │   Tab: 📖 错题本                       │ │
+│ │   Tab: 🔬 诊断评估                      │ │
+│ │   Tab: 📅 学习计划                      │ │
+│ └─────────────────────────────────────────┘ │
+└────────────────────────────────────────────┘
+
+【session_state 管理（20 个 key）】
+使用 st.session_state 管理全部应用状态（无外部状态管理库）：
+- _S_DB / _S_LLM / _S_ENGINE      — 核心服务单例（惰性初始化）
+- _S_KPS / _S_MATERIAL_ID          — 解析结果
+- _S_QUIZ_ENGINE / _S_QUESTIONS    — 练习答题状态
+- _S_ASSESSMENT_*                  — 诊断评估状态（Engine / Questions / Report）
+- _S_PLAN / _S_PLAN_ACTIVE_KP      — 学习计划状态
+- _S_SOCRATIC_*                    — 苏格拉底追问状态（Engine / Active / History）
+- _S_PARSE_ERROR                   — 错误展示
+
+【异步处理策略】
+Streamlit 不支持原生 async，使用 _run_async() 包装：
+- 优先 asyncio.run()（Python 3.7+ 标准方式）
+- 若已有 event loop → 尝试 nest_asyncio.apply() + run_until_complete()
+- 仅对非 UI 的 I/O 密集操作使用异步（LLM 调用、数据库写入）
+
+【耦合关系】
+- 依赖 super_tutor/ 下所有包：config、core、engine、models
+- 导入 5 个 Engine：KnowledgeEngine、QuizEngine、AssessmentEngine、
+  PlanEngine、SocraticEngine
+- 导入 5 个 Model：KnowledgePoint、Question、QuizAttempt、
+  AssessmentReport、StudyPlan、SocraticTurn
+- 导入 2 个枚举：DifficultyLevel、QuestionType
+- 导入 Database、LLMClient（直接实例化）
+- 被 streamlit run 启动（仅此一种运行方式）
+- 不定义任何业务逻辑 — 所有逻辑委托给 engine/ 层
 """
 
 from __future__ import annotations

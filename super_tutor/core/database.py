@@ -1,16 +1,25 @@
-"""SQLite persistence layer for Super Tutor.
+"""SQLite 持久化层 — Super Tutor 的全部数据存储。
 
-Provides structured storage for materials, knowledge points, questions,
-quiz attempts, wrong-answer tracking, and study plans.  Uses aiosqlite
-for async I/O.
+【功能说明】
+基于 aiosqlite 的异步 SQLite 数据库管理器，管理 6 张核心表：
+1. materials — 学习材料（上传的 PDF/文本）
+2. knowledge_points — 知识点（含双向前置/后继关系、掌握度追踪）
+3. questions — 题库（由 LLM 生成的题目）
+4. quiz_attempts — 作答记录（学生每次做题的结果）
+5. wrong_questions — 错题本（自动收录的错题，含解决状态）
+6. study_plans — 学习计划（拓扑排序后的知识点序列）
 
-Tables (6):
-    materials         – 学习材料
-    knowledge_points  – 知识点
-    questions         – 题库
-    quiz_attempts     – 作答记录
-    wrong_questions   – 错题本
-    study_plans       – 学习计划
+数据库特性：
+- WAL 模式（提升并发读取性能）
+- 外键约束（保证数据完整性）
+- 所有 CRUD 方法均异步（async/await）
+- JSON 字段（prerequisite_ids、successor_ids 等）存储为字符串，读写时序列化/反序列化
+
+【耦合关系】
+- 被 app.py 的 _init_services() 创建唯一实例，存入 st.session_state[_S_DB]
+- 被所有 5 个 Engine 依赖（KnowledgeEngine、QuizEngine、AssessmentEngine、
+  PlanEngine、SocraticEngine）
+- 不依赖项目内其他模块（底层基础设施）
 """
 
 from __future__ import annotations
@@ -18,7 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence
 
 import aiosqlite
 
@@ -26,26 +35,28 @@ logger = logging.getLogger(__name__)
 
 
 class Database:
-    """Async SQLite database manager for a Super Tutor teaching session.
+    """异步 SQLite 数据库管理器。
 
-    Each session owns one ``super_tutor.db`` file managed through this class.
-    The database contains six tables:
+    每个教学会话拥有一个 super_tutor.db 文件，通过本类管理。
+    所有 CRUD 方法均为异步，使用参数化查询防止 SQL 注入。
 
-    * **materials** – learning materials with course type.
-    * **knowledge_points** – knowledge points extracted from materials,
-      with prerequisite/successor relationships and mastery tracking.
-    * **questions** – quiz questions linked to knowledge points.
-    * **quiz_attempts** – student answer records.
-    * **wrong_questions** – wrong-answer notebook for review.
-    * **study_plans** – personalised learning plans with KP sequences.
+    6 张核心表的数据关系：
+    materials (1) ──→ (N) knowledge_points
+    knowledge_points (1) ──→ (N) questions
+    questions (1) ──→ (N) quiz_attempts
+    questions + students ──→ wrong_questions
+    knowledge_points ──→ study_plans (kp_sequence 字段)
 
-    Attributes:
-        db_path: Absolute path to the SQLite database file.
-        config: TutorConfig instance providing API keys and defaults.
+    Usage::
+
+        db = Database(db_path="/path/to/super_tutor.db")
+        await db.initialize()  # 创建连接 + 建表
+        await db.create_material({...})
+        await db.close()
     """
 
     # ==================================================================
-    # DDL (Data Definition Language)
+    # DDL — 6 张表的建表语句
     # ==================================================================
 
     _DDL_MATERIALS = """
@@ -188,59 +199,62 @@ class Database:
     """
 
     # ==================================================================
-    # Lifecycle
+    # 生命周期 — 连接管理
     # ==================================================================
 
     def __init__(self, db_path: str) -> None:
-        """Initialise the Database manager.
+        """初始化 Database 实例（不建立连接）。
 
         Args:
-            db_path: Path to the SQLite database file (e.g.
-                ``/home/user/super-tutor/super_tutor.db``).
+            db_path: SQLite 数据库文件路径（如 ~/.super-tutor/super_tutor.db）。
 
         Raises:
-            ValueError: If the parent directory does not exist.
+            ValueError: 如果父目录不存在。
         """
         self.db_path: str = self._validate_db_path(db_path)
         self._conn: Optional[aiosqlite.Connection] = None
 
     async def initialize(self) -> None:
-        """Open the database and create all tables.
+        """打开数据库连接并创建所有表（幂等操作）。
 
-        This method is idempotent: calling it multiple times is safe (the
-        connection is reused once opened).  Tables use ``IF NOT EXISTS`` so
-        existing data is never overwritten.
+        特性：
+        - 首次调用时：建立连接 → 启用 WAL 模式 → 开启外键约束 → 建表
+        - 重复调用时：直接返回（_conn 已存在）
+        - 所有表使用 IF NOT EXISTS，不会覆盖已有数据
 
         Raises:
-            RuntimeError: If the database connection cannot be established.
-            ValueError: If the database path is invalid.
+            RuntimeError: 数据库连接建立失败。
         """
         if self._conn is not None:
-            return  # already initialised
+            return  # 已初始化，幂等返回
 
         self._conn = await aiosqlite.connect(self.db_path)
-        self._conn.row_factory = aiosqlite.Row
-        # Enable WAL mode for better concurrent read performance.
+        self._conn.row_factory = aiosqlite.Row  # 支持按列名访问结果
+        # WAL 模式 — 允许并发读写，读取不阻塞写入
         await self._conn.execute("PRAGMA journal_mode=WAL;")
+        # 外键约束 — 确保数据引用完整性
         await self._conn.execute("PRAGMA foreign_keys=ON;")
 
         await self._create_tables()
 
     async def close(self) -> None:
-        """Close the database connection gracefully.
+        """优雅关闭数据库连接。
 
-        Safe to call even if ``initialize`` was never called.
+        即使从未调用 initialize() 也安全（_conn 为 None 时跳过）。
         """
         if self._conn is not None:
             await self._conn.close()
             self._conn = None
 
     # ==================================================================
-    # Internal: table creation & validation
+    # 内部方法 — 建表和路径验证
     # ==================================================================
 
     async def _create_tables(self) -> None:
-        """Execute all DDL statements to ensure required tables exist."""
+        """按顺序执行所有 DDL 语句，确保 6 张表全部存在。
+
+        使用 executescript 支持多语句一次性执行（含 CREATE INDEX）。
+        """
         assert self._conn is not None
         ddl_statements = [
             self._DDL_MATERIALS,
@@ -256,18 +270,16 @@ class Database:
 
     @staticmethod
     def _validate_db_path(db_path: str) -> str:
-        """Validate and resolve the database path.
-
-        Ensures the parent directory exists.
+        """验证并解析数据库路径，确保父目录存在。
 
         Args:
-            db_path: Requested database file path (may be relative or absolute).
+            db_path: 请求的数据库文件路径（可为相对路径或包含 ~）。
 
         Returns:
-            The resolved absolute path.
+            str: 解析后的绝对路径。
 
         Raises:
-            ValueError: If the parent directory does not exist.
+            ValueError: 父目录不存在。
         """
         resolved = os.path.abspath(os.path.expanduser(db_path))
         parent_dir = os.path.dirname(resolved)
@@ -280,33 +292,32 @@ class Database:
         return resolved
 
     # ==================================================================
-    # Helpers
+    # 辅助工具 — 行转换
     # ==================================================================
 
     @staticmethod
     def _row_to_dict(row: aiosqlite.Row) -> dict[str, Any]:
-        """Convert an aiosqlite.Row into a plain dict."""
+        """将 aiosqlite.Row 转为普通 dict。"""
         return dict(row)
 
     @staticmethod
     def _rows_to_dicts(rows: Sequence[aiosqlite.Row]) -> list[dict[str, Any]]:
-        """Convert a sequence of aiosqlite.Row objects into a list of dicts."""
+        """批量转换：aisqlite.Row 列表 → dict 列表。"""
         return [dict(r) for r in rows]
 
     # ==================================================================
-    # Material CRUD
+    # 1. 学习材料 CRUD — materials 表
     # ==================================================================
 
     async def create_material(self, material: dict[str, Any]) -> str:
-        """Insert a new learning material record.
+        """插入一条新的学习材料记录。
 
         Args:
-            material: A dict with at least ``"material_id"``, ``"title"``,
-                ``"content"``, ``"created_at"``, ``"updated_at"``.
-                Optional keys: ``"course_type"``, ``"status"``.
+            material: 至少包含 material_id、title、content、created_at、updated_at。
+                      可选：course_type、status。
 
         Returns:
-            The ``material_id`` of the newly created row.
+            str: 新创建记录的 material_id。
         """
         assert self._conn is not None
         await self._conn.execute(
@@ -328,13 +339,10 @@ class Database:
         return material["material_id"]
 
     async def get_material(self, material_id: str) -> Optional[dict[str, Any]]:
-        """Retrieve a single material by its ID.
-
-        Args:
-            material_id: The material UUID.
+        """按 ID 查询单条学习材料。
 
         Returns:
-            A dict with material fields, or *None* if not found.
+            dict | None: 找到返回字段字典，未找到返回 None。
         """
         assert self._conn is not None
         cursor = await self._conn.execute(
@@ -346,13 +354,13 @@ class Database:
     async def update_material(
         self, material_id: str, updates: dict[str, Any]
     ) -> None:
-        """Partially update a material record.
+        """部分更新学习材料记录。
+
+        仅更新白名单内的字段：title、content、course_type、status、updated_at。
 
         Args:
-            material_id: The material to update.
-            updates: Dict of column → new value.  Only whitelisted columns
-                (``title``, ``content``, ``course_type``, ``status``,
-                ``updated_at``) are applied.
+            material_id: 要更新的材料 ID。
+            updates: 字段→新值的字典。
         """
         allowed = {"title", "content", "course_type", "status", "updated_at"}
         filtered = {k: v for k, v in updates.items() if k in allowed}
@@ -368,23 +376,27 @@ class Database:
         await self._conn.commit()
 
     # ==================================================================
-    # Knowledge Point CRUD
+    # 2. 知识点 CRUD — knowledge_points 表
+    #    核心表：存储知识点及其双向前置/后继关系（JSON 字符串）
     # ==================================================================
 
     async def insert_knowledge_point(self, kp: dict[str, Any]) -> str:
-        """Insert a knowledge point.
+        """插入一条知识点记录。
+
+        注意：
+        - keywords、prerequisite_ids、successor_ids 在 DB 中存为 JSON 字符串
+        - 插入时通过 _json_field() 自动序列化列表/字典
 
         Args:
-            kp: Dict with keys matching ``knowledge_points`` columns.
-                Required: ``kp_id``, ``material_id``, ``content``,
-                ``created_at``.
+            kp: 至少包含 kp_id、material_id、content、created_at。
 
         Returns:
-            The ``kp_id`` of the inserted row.
+            str: 新创建记录的 kp_id。
         """
         assert self._conn is not None
 
         def _json_field(value: Any) -> str:
+            """将列表/字典序列化为 JSON 字符串，用于 DB 存储。"""
             if isinstance(value, (list, dict)):
                 return json.dumps(value, ensure_ascii=False)
             return str(value) if value else "[]"
@@ -422,7 +434,12 @@ class Database:
         return kp["kp_id"]
 
     async def get_knowledge_point(self, kp_id: str) -> Optional[dict[str, Any]]:
-        """Retrieve a single knowledge point by ID."""
+        """按 ID 查询单个知识点。
+
+        Returns:
+            dict | None: 找到返回字段字典（JSON 字段为字符串，需调用 _parse_json_list 解析），
+                         未找到返回 None。
+        """
         assert self._conn is not None
         cursor = await self._conn.execute(
             "SELECT * FROM knowledge_points WHERE kp_id = ?", (kp_id,)
@@ -433,7 +450,10 @@ class Database:
     async def list_knowledge_points_by_material(
         self, material_id: str
     ) -> list[dict[str, Any]]:
-        """List all knowledge points belonging to a material, ordered by page."""
+        """列出某教材的所有知识点，按章节序号和时间排序。
+
+        用于 KnowledgeEngine.get_by_material()。
+        """
         assert self._conn is not None
         cursor = await self._conn.execute(
             """SELECT * FROM knowledge_points
@@ -447,11 +467,9 @@ class Database:
     async def list_knowledge_points_with_mastery(
         self,
     ) -> list[dict[str, Any]]:
-        """List all knowledge points with their mastery levels.
+        """列出所有知识点及其掌握度，按掌握度升序（最薄弱优先）。
 
-        Returns:
-            A list of knowledge point dicts ordered by mastery_level
-            ascending (weakest first).
+        用于 PlanEngine 和 AssessmentEngine 的数据查询。
         """
         assert self._conn is not None
         cursor = await self._conn.execute(
@@ -464,11 +482,11 @@ class Database:
     async def upsert_knowledge_point_mastery(
         self, kp_id: str, mastery_level: float
     ) -> None:
-        """Update the mastery level of a knowledge point.
+        """更新单个知识点的掌握度（覆盖写入）。
 
         Args:
-            kp_id: The knowledge point identifier.
-            mastery_level: New mastery level (0.0 – 1.0).
+            kp_id: 知识点 ID。
+            mastery_level: 新的掌握度值（0.0–1.0）。
         """
         assert self._conn is not None
         await self._conn.execute(
@@ -480,12 +498,14 @@ class Database:
     async def update_knowledge_point(
         self, kp_id: str, updates: dict[str, Any]
     ) -> None:
-        """Update specific columns of a knowledge point.
+        """部分更新知识点字段。
+
+        用于 KnowledgeEngine.parse() 中双向写入前置/后继关系。
+        列表/字典类型的值自动序列化为 JSON 字符串。
 
         Args:
-            kp_id: The knowledge point identifier.
-            updates: Dict of column_name → new_value.  Only the keys
-                present are updated; all others are left unchanged.
+            kp_id: 知识点 ID。
+            updates: 字段→新值的字典（只更新白名单内字段）。
         """
         assert self._conn is not None
         allowed = {
@@ -514,23 +534,23 @@ class Database:
         await self._conn.commit()
 
     # ==================================================================
-    # Question CRUD
+    # 3. 题目 CRUD — questions 表
+    #    使用 INSERT OR REPLACE 支持幂等写入
     # ==================================================================
 
     async def insert_question(self, question: dict[str, Any]) -> str:
-        """Insert a quiz question.
+        """插入一道题目（幂等：已存在则替换）。
 
         Args:
-            question: Dict with keys matching ``questions`` columns.
-                Required: ``question_id``, ``type``, ``stem``,
-                ``correct_answer``, ``created_at``.
+            question: 至少包含 question_id、type、stem、correct_answer、created_at。
 
         Returns:
-            The ``question_id`` of the inserted row.
+            str: question_id。
         """
         assert self._conn is not None
 
         def _json_field(value: Any) -> str:
+            """将列表/字典序列化为 JSON 字符串。"""
             if isinstance(value, (list, dict)):
                 return json.dumps(value, ensure_ascii=False)
             return str(value) if value else "[]"
@@ -569,7 +589,10 @@ class Database:
         return question["question_id"]
 
     async def get_question(self, question_id: str) -> Optional[dict[str, Any]]:
-        """Retrieve a single question by ID."""
+        """按 ID 查询单道题目。
+
+        用于错题本渲染时获取题干、正确答案和解析。
+        """
         assert self._conn is not None
         cursor = await self._conn.execute(
             "SELECT * FROM questions WHERE question_id = ?", (question_id,)
@@ -578,18 +601,18 @@ class Database:
         return self._row_to_dict(row) if row else None
 
     # ==================================================================
-    # Quiz Attempt CRUD
+    # 4. 作答记录 CRUD — quiz_attempts 表
+    #    每次学生提交答案后写入一条记录
     # ==================================================================
 
     async def insert_attempt(self, attempt: dict[str, Any]) -> str:
-        """Insert a quiz attempt record.
+        """插入一条作答记录。
 
         Args:
-            attempt: Dict with keys matching ``quiz_attempts`` columns.
-                Required: ``attempt_id``, ``question_id``, ``started_at``.
+            attempt: 至少包含 attempt_id、question_id、started_at。
 
         Returns:
-            The ``attempt_id`` of the inserted row.
+            str: attempt_id。
         """
         assert self._conn is not None
 
@@ -598,6 +621,7 @@ class Database:
                 return json.dumps(value, ensure_ascii=False)
             return str(value) if value else "[]"
 
+        # 学生答案可能是字符串或复杂对象（如 JSON），统一序列化
         student_answer = attempt.get("student_answer")
         if isinstance(student_answer, (dict, list)):
             student_answer = json.dumps(student_answer, ensure_ascii=False)
@@ -650,17 +674,17 @@ class Database:
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
-        """List quiz attempts filtered by student, with optional filters.
+        """按学生分页查询作答记录，支持按正确性和知识点过滤。
 
         Args:
-            student_id: The student identifier.
-            is_correct: Optional correctness filter.
-            kp_id: Optional knowledge point filter.
-            limit: Max rows to return.
-            offset: Pagination offset.
+            student_id: 学生标识。
+            is_correct: 可选的正确性过滤（True=只看正确，False=只看错误）。
+            kp_id: 可选的知识点过滤。
+            limit: 每页条数。
+            offset: 分页偏移量。
 
         Returns:
-            A tuple of (items, total_count).
+            tuple: (items 列表, total 总数)。
         """
         assert self._conn is not None
 
@@ -673,14 +697,14 @@ class Database:
             where += " AND kp_id = ?"
             params.append(kp_id)
 
-        # Total count
+        # 查询总数（用于分页计算）
         count_cursor = await self._conn.execute(
             f"SELECT COUNT(*) FROM quiz_attempts {where}", params
         )
         count_row = await count_cursor.fetchone()
         total = count_row[0] if count_row else 0
 
-        # Paginated rows
+        # 分页查询
         cursor = await self._conn.execute(
             f"""SELECT * FROM quiz_attempts {where}
                 ORDER BY submitted_at DESC
@@ -691,20 +715,19 @@ class Database:
         return (self._rows_to_dicts(rows), total)
 
     # ==================================================================
-    # Wrong Questions CRUD (错题本)
+    # 5. 错题本 CRUD — wrong_questions 表
+    #    自动收录学生答错的题目，支持解决状态追踪
     # ==================================================================
 
     async def insert_wrong_question(self, record: dict[str, Any]) -> str:
-        """Insert a wrong-answer notebook entry.
+        """插入一条错题记录（幂等：已存在则替换）。
 
         Args:
-            record: Dict with keys ``wrong_id``, ``student_id``,
-                ``question_id``, ``correct_answer``, ``created_at``,
-                ``updated_at``.  Optional: ``kp_id``, ``wrong_answer``,
-                ``attempt_count``, ``resolution_status``, ``note``.
+            record: 至少包含 wrong_id、student_id、question_id、
+                    correct_answer、created_at、updated_at。
 
         Returns:
-            The ``wrong_id`` of the inserted row.
+            str: wrong_id。
         """
         assert self._conn is not None
         await self._conn.execute(
@@ -738,7 +761,10 @@ class Database:
     async def get_wrong_question(
         self, wrong_id: str
     ) -> Optional[dict[str, Any]]:
-        """Retrieve a single wrong-question entry by ID."""
+        """按 ID 查询单条错题记录。
+
+        用于 SocraticEngine 获取错题上下文。
+        """
         assert self._conn is not None
         cursor = await self._conn.execute(
             "SELECT * FROM wrong_questions WHERE wrong_id = ?", (wrong_id,)
@@ -749,9 +775,13 @@ class Database:
     async def get_wrong_question_by_student_and_question(
         self, student_id: str, question_id: str
     ) -> Optional[dict[str, Any]]:
-        """Find an existing wrong-question entry for a student + question pair.
+        """按学生+题目组合查找已有错题记录。
 
-        Returns ``None`` when no entry exists for this pair.
+        用于 QuizEngine.add_to_wrong_book() 判断是新增还是追加。
+        同一学生答错同一道题时，不新增记录，而是递增 attempt_count。
+
+        Returns:
+            dict | None: 找到返回现有记录，未找到返回 None。
         """
         assert self._conn is not None
         cursor = await self._conn.execute(
@@ -770,17 +800,17 @@ class Database:
         limit: int = 20,
         offset: int = 0,
     ) -> tuple[list[dict[str, Any]], int]:
-        """Paginated list of wrong questions for a student.
+        """分页列出学生的错题记录。
 
         Args:
-            student_id: The student identifier.
-            resolution_status: Optional filter (``unresolved``,
-                ``reviewing``, ``resolved``).
-            limit: Max rows to return.
-            offset: Pagination offset.
+            student_id: 学生标识。
+            resolution_status: 可选的解决状态过滤
+                （unresolved=未解决、reviewing=复习中、resolved=已解决）。
+            limit: 每页条数。
+            offset: 分页偏移量。
 
         Returns:
-            A tuple of (items, total_count).
+            tuple: (items 列表, total 总数)。
         """
         assert self._conn is not None
 
@@ -790,14 +820,14 @@ class Database:
             where += " AND resolution_status = ?"
             params.append(resolution_status)
 
-        # Total count
+        # 查询总数
         count_cursor = await self._conn.execute(
             f"SELECT COUNT(*) FROM wrong_questions {where}", params
         )
         count_row = await count_cursor.fetchone()
         total = count_row[0] if count_row else 0
 
-        # Paginated rows
+        # 分页查询，按创建时间倒序（最新的错题先显示）
         cursor = await self._conn.execute(
             f"""SELECT * FROM wrong_questions {where}
                 ORDER BY created_at DESC
@@ -810,12 +840,11 @@ class Database:
     async def update_wrong_question(
         self, wrong_id: str, updates: dict[str, Any]
     ) -> None:
-        """Update fields of a single wrong-question entry.
+        """更新单条错题记录的字段。
 
         Args:
-            wrong_id: The wrong question identifier.
-            updates: Key-value pairs to update (e.g.
-                ``{"resolution_status": "resolved"}``).
+            wrong_id: 错题记录 ID。
+            updates: 要更新的字段→新值字典（如 {"resolution_status": "resolved"}）。
         """
         assert self._conn is not None
         set_clauses = []
@@ -832,23 +861,24 @@ class Database:
         await self._conn.commit()
 
     # ==================================================================
-    # Study Plan CRUD
+    # 6. 学习计划 CRUD — study_plans 表
+    #    kp_sequence 字段存储 JSON 序列化的知识点序列
     # ==================================================================
 
     async def create_study_plan(self, plan: dict[str, Any]) -> str:
-        """Create a study plan with an embedded KP sequence.
+        """创建一条学习计划记录。
+
+        kp_sequence 字段如果在 Python 中是列表，自动序列化为 JSON 字符串存储。
 
         Args:
-            plan: Dict with ``plan_id``, ``student_id``, ``start_date``,
-                ``created_at``, ``updated_at``.  Optional: ``title``,
-                ``description``, ``goal``, ``end_date``, ``status``,
-                ``kp_sequence``, ``metadata``.
+            plan: 至少包含 plan_id、student_id、start_date、created_at、updated_at。
 
         Returns:
-            The ``plan_id`` of the newly created plan.
+            str: plan_id。
         """
         assert self._conn is not None
 
+        # 序列化 kp_sequence（知识点 ID 列表 → JSON 字符串）
         kp_sequence = plan.get("kp_sequence", [])
         if isinstance(kp_sequence, list):
             kp_sequence = json.dumps(kp_sequence, ensure_ascii=False)
@@ -881,7 +911,10 @@ class Database:
         return plan["plan_id"]
 
     async def get_study_plan(self, plan_id: str) -> Optional[dict[str, Any]]:
-        """Retrieve a single study plan by ID."""
+        """按 ID 查询单个学习计划。
+
+        kp_sequence 字段从 JSON 字符串反序列化为 Python 列表。
+        """
         assert self._conn is not None
         cursor = await self._conn.execute(
             "SELECT * FROM study_plans WHERE plan_id = ?", (plan_id,)
@@ -890,7 +923,7 @@ class Database:
         if row is None:
             return None
         result = self._row_to_dict(row)
-        # Deserialise kp_sequence from JSON
+        # 反序列化 kp_sequence：JSON 字符串 → Python 列表
         try:
             result["kp_sequence"] = json.loads(result.get("kp_sequence", "[]"))
         except (json.JSONDecodeError, TypeError):

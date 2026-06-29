@@ -1,4 +1,17 @@
 @echo off
+REM ===========================================================================
+REM Super Tutor — Windows 一键启动脚本
+REM
+REM 【功能说明】
+REM 1. 首次运行：交互式配置 API Key / Base URL / Model → 写入
+REM    %USERPROFILE%\.super-tutor\settings.json
+REM 2. 后续运行：跳过配置，直接启动 Streamlit 前端（app.py）
+REM
+REM 【耦合关系】
+REM - 启动 app.py（Streamlit 单页应用）
+REM - 配置写入 config.py 读取的 settings.json
+REM - 端口：Streamlit 默认 8501
+REM ===========================================================================
 chcp 65001 >nul 2>&1
 setlocal enabledelayedexpansion
 

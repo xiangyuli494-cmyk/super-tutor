@@ -1,7 +1,31 @@
-"""Quiz Engine — 题目生成、自动批改与错题收录。
+"""测验引擎 — 题目生成、自动批改与错题收录。
 
-将 LLM 出题、程序/LLM 批改和错题本维护封装为高层次的
-业务逻辑组件，供 orchestration 层和前端直接使用。
+【功能说明】
+将 LLM 出题、程序/LLM 混合批改和错题本维护封装为高层业务逻辑组件。
+是 Super Tutor 中使用频率最高的引擎。
+
+核心能力：
+1. generate_questions(): LLM 生成题目 → 持久化到 questions 表
+2. grade_answers(): 混合批改 — 选择/判断题程序批改（零 LLM 成本），
+   其他题型交给 LLM 语义批改
+3. add_to_wrong_book(): 自动收录错题 → 重复答错递增 attempt_count
+
+批改分流策略（节约 LLM 成本的关键设计）：
+- 程序批改（_grade_programmatic）: multiple_choice、true_false
+  → 直接比对答案，正确=1.0分，错误=0.0分
+- LLM 批改（_grade_via_llm）: fill_in_blank、short_answer、essay、coding
+  → 调用 LLM 按评分标准打分，返回 misconceptions（迷思概念诊断）
+
+题目数量分配策略（_distribute_counts）：
+- 将 total 道题均匀分配到 N 个 KP，余数按顺序分配给前面的 KP
+- 例：5 道题，3 个 KP → [2, 2, 1]
+
+【耦合关系】
+- 依赖 Database（题目和作答记录的 CRUD）、LLMClient（出题和批改 API）
+- 依赖 KnowledgeEngine（获取 KP 内容和前置知识作为出题上下文）
+- 被 app.py 的练习答题 Tab、错题本 Tab、计划 Tab 调用
+- 被 AssessmentEngine 委托批改（grade_answers）
+- 使用 prompts/quiz_gen.md（出题提示词）和 prompts/grade.md（批改提示词）
 """
 
 from __future__ import annotations
@@ -26,11 +50,11 @@ logger = logging.getLogger(__name__)
 # 默认 prompt 路径
 # ---------------------------------------------------------------------------
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
-_DEFAULT_QUIZ_GEN_PROMPT = _PROMPTS_DIR / "quiz_gen.md"
-_DEFAULT_GRADE_PROMPT = _PROMPTS_DIR / "grade.md"
+_DEFAULT_QUIZ_GEN_PROMPT = _PROMPTS_DIR / "quiz_gen.md"    # 出题系统提示词
+_DEFAULT_GRADE_PROMPT = _PROMPTS_DIR / "grade.md"           # 批改系统提示词
 
 # ---------------------------------------------------------------------------
-# 程序批改覆盖的题型
+# 程序批改覆盖的题型 — 这些题型不需要调用 LLM
 # ---------------------------------------------------------------------------
 _PROGRAMMATIC_TYPES: set[str] = {"multiple_choice", "true_false"}
 
@@ -38,7 +62,7 @@ _PROGRAMMATIC_TYPES: set[str] = {"multiple_choice", "true_false"}
 class QuizEngine:
     """测验引擎 — 出题、批改和错题收录。
 
-    封装了 LLM 出题、程序/LLM 混合批改和错题本写入逻辑。
+    封装了 LLM 出题 → 程序/LLM 混合批改 → 错题本写入的完整流程。
 
     Usage::
 
@@ -58,14 +82,14 @@ class QuizEngine:
         quiz_gen_prompt_path: str | None = None,
         grade_prompt_path: str | None = None,
     ) -> None:
-        """Initialise the quiz engine.
+        """初始化测验引擎。
 
         Args:
-            db: An initialised ``Database`` instance.
-            llm_client: An ``LLMClient`` instance for LLM calls.
-            knowledge_engine: A ``KnowledgeEngine`` for KP lookups.
-            quiz_gen_prompt_path: Optional custom quiz-gen prompt path.
-            grade_prompt_path: Optional custom grading prompt path.
+            db: 已初始化的 Database 实例。
+            llm_client: LLMClient 实例（用于出题和批改 API 调用）。
+            knowledge_engine: KnowledgeEngine 实例（用于获取 KP 内容和前置知识）。
+            quiz_gen_prompt_path: 可选的自定义出题提示词路径。
+            grade_prompt_path: 可选的自定义批改提示词路径。
         """
         self._db = db
         self._llm = llm_client
@@ -78,7 +102,7 @@ class QuizEngine:
         )
 
     # ==================================================================
-    # generate_questions
+    # generate_questions() — LLM 出题
     # ==================================================================
 
     async def generate_questions(
@@ -88,28 +112,34 @@ class QuizEngine:
         difficulty: str | None = None,
         types: list[str] | None = None,
     ) -> list[Question]:
-        """Generate quiz questions based on knowledge points.
+        """根据知识点生成测验题目。
 
-        Fetches each knowledge point and its prerequisites from the
-        database, builds a context-rich prompt, and calls the LLM to
-        generate questions.  Results are persisted to ``questions``.
+        完整流程（5 步）：
+        1. 收集知识点数据 — 从 DB 获取 KP + 前置知识摘要（作为出题上下文）
+        2. 构建 prompt 上下文 — 将 KP 信息格式化为 LLM 输入
+        3. 加载系统提示词 → 调用 LLM（temperature=0.7, max_tokens=8192）
+        4. 解析 JSON → 创建 Question 对象
+        5. 逐题持久化到 questions 表
 
         Args:
-            kp_ids: Knowledge point IDs to base questions on.
-            count: Total number of questions to generate.
-            difficulty: Optional difficulty override (e.g. ``"medium"``).
-            types: Optional question type filter (e.g.
-                ``["multiple_choice", "short_answer"]``).
+            kp_ids: 要出题的知识点 ID 列表。
+            count: 要生成的题目总数。
+            difficulty: 可选的统一难度（None=由 AI 自动按比例分配）。
+            types: 可选的题型过滤（None=全部题型）。
 
         Returns:
-            The list of newly created ``Question`` objects.
+            Question 对象列表。
+
+        Raises:
+            ValueError: kp_ids 为空或 count < 1。
+            MaterialError: LLM 调用失败或返回无效 JSON。
         """
         if not kp_ids:
             raise ValueError("kp_ids must not be empty")
         if count < 1:
             raise ValueError("count must be >= 1")
 
-        # -- 1. Collect knowledge point data ---------------------------------
+        # -- 第 1 步：收集知识点数据 -----------------------------------------
         kp_infos: list[dict[str, Any]] = []
         for kp_id in kp_ids:
             kp_row = await self._db.get_knowledge_point(kp_id)
@@ -117,7 +147,7 @@ class QuizEngine:
                 logger.warning("Knowledge point not found: %s", kp_id)
                 continue
 
-            # Fetch prerequisite summaries for context injection
+            # 获取前置知识点的摘要（注入到出题上下文中，帮助 LLM 理解 KP 背景）
             prereq_ids: list[str] = _parse_json_list(
                 kp_row.get("prerequisite_ids", "[]")
             )
@@ -144,7 +174,7 @@ class QuizEngine:
         if not kp_infos:
             raise ValueError("None of the given kp_ids exist in the database")
 
-        # -- 2. Build prompt context -----------------------------------------
+        # -- 第 2 步：构建 prompt 上下文 -------------------------------------
         kp_context_lines: list[str] = []
         for info in kp_infos:
             lines = [
@@ -162,9 +192,10 @@ class QuizEngine:
 
         kp_context = "\n---\n".join(kp_context_lines)
 
-        # Distribute count across KPs
+        # 均匀分配题目数量到各个 KP
         per_kp = _distribute_counts([i["kp_id"] for i in kp_infos], count)
 
+        # 构建出题约束
         constraints: list[str] = [f"请生成 {count} 道题目。"]
         constraints.append(
             f"知识点分布: {', '.join(f'{kid}:{n}道' for kid, n in per_kp.items())}"
@@ -179,7 +210,7 @@ class QuizEngine:
             f"## 出题要求\n\n" + "\n".join(f"- {c}" for c in constraints)
         )
 
-        # -- 3. Load system prompt & call LLM --------------------------------
+        # -- 第 3 步：加载系统提示词并调用 LLM --------------------------------
         try:
             system_prompt = Path(self._quiz_gen_prompt_path).read_text(
                 encoding="utf-8"
@@ -202,15 +233,15 @@ class QuizEngine:
         try:
             raw = await self._llm.chat(
                 messages=messages,
-                temperature=0.7,
-                max_tokens=8192,
-                timeout=180,
+                temperature=0.7,    # 中等温度保证题目多样性
+                max_tokens=8192,    # 大 token 预算应对多道题
+                timeout=180,        # 3 分钟超时
             )
         except LLMError as exc:
             raise MaterialError(f"LLM 出题失败: {exc}") from exc
 
-        # -- 4. Parse JSON response ------------------------------------------
-        raw = _strip_markdown_fence(raw)
+        # -- 第 4 步：解析 JSON 响应 ------------------------------------------
+        raw = _strip_markdown_fence(raw)  # 去除 ```json ... ``` 围栏
 
         try:
             data = json.loads(raw)
@@ -222,11 +253,11 @@ class QuizEngine:
         if not raw_questions:
             raise MaterialError("LLM 未生成任何题目。")
 
-        # -- 5. Create Question objects & persist ----------------------------
+        # -- 第 5 步：创建 Question 对象并持久化 ------------------------------
         created: list[Question] = []
         now = datetime.now(timezone.utc).isoformat()
 
-        # Fallback kp_id: use the first requested KP when the LLM omits it
+        # fallback kp_id：当 LLM 没返回 kp_id 时，使用第一个请求的 KP
         _fallback_kp_id = kp_ids[0] if kp_ids else ""
 
         for item in raw_questions:
@@ -251,6 +282,7 @@ class QuizEngine:
                 created_at=now,
             )
 
+            # 逐题写入 questions 表
             await self._db.insert_question(
                 {
                     "question_id": q.question_id,
@@ -279,7 +311,7 @@ class QuizEngine:
         return created
 
     # ==================================================================
-    # grade_answers
+    # grade_answers() — 混合批改（核心分流逻辑）
     # ==================================================================
 
     async def grade_answers(
@@ -288,30 +320,27 @@ class QuizEngine:
         student_answers: list[dict[str, Any]],
         student_id: str = "",
     ) -> list[QuizAttempt]:
-        """Grade a batch of student answers.
+        """批改一批学生答案。
 
-        Multiple-choice and true/false questions are graded
-        programmatically (no LLM cost).  All other types are sent to
-        the LLM for semantic grading.
+        分流策略（节约 LLM 成本的关键设计）：
+        - 选择题 + 判断题 → _grade_programmatic（程序直接比对，零 LLM 成本）
+        - 填空/简答/论述/编程题 → _grade_via_llm（调用 LLM 语义批改）
 
         Args:
-            questions: The ``Question`` objects being answered.
-            student_answers: A list of dicts, each containing at least
-                ``question_id`` and ``student_answer``.  May also include
-                ``time_spent_seconds``, ``hints_used``,
-                ``attempt_number``, ``confidence``.
-            grades: Pre-determined (full credit) statuses for any/all.
+            questions: 被作答的 Question 对象列表。
+            student_answers: 学生答案列表，每项包含 question_id 和 student_answer。
+            student_id: 学生标识。
 
         Returns:
-            A list of ``QuizAttempt`` objects (one per answer).
+            QuizAttempt 对象列表（每题一条记录）。
         """
-        # -- 1. Build question lookup ----------------------------------------
+        # -- 第 1 步：构建查找表 --------------------------------------------
         q_map: dict[str, Question] = {q.question_id: q for q in questions}
         answer_map: dict[str, dict] = {
             a["question_id"]: a for a in student_answers
         }
 
-        # -- 2. Split: programmatic vs LLM -----------------------------------
+        # -- 第 2 步：分流 — 程序批改 vs LLM 批改 ---------------------------
         programmatic_items: list[tuple[Question, dict]] = []
         llm_items: list[tuple[Question, dict]] = []
 
@@ -326,7 +355,7 @@ class QuizEngine:
             else:
                 llm_items.append((q, a))
 
-        # -- 3. Programmatic grading -----------------------------------------
+        # -- 第 3 步：程序批改（选择题+判断题）-------------------------------
         now = datetime.now(timezone.utc).isoformat()
         attempts: list[QuizAttempt] = []
 
@@ -339,7 +368,7 @@ class QuizEngine:
             )
             attempts.append(attempt)
 
-        # -- 4. LLM grading --------------------------------------------------
+        # -- 第 4 步：LLM 批改（填空/简答/论述/编程题）-----------------------
         if llm_items:
             llm_attempts = await _grade_via_llm(
                 self._llm,
@@ -348,7 +377,7 @@ class QuizEngine:
                 student_id,
                 now,
             )
-            # Persist each LLM-graded attempt
+            # 持久化每个 LLM 批改的结果
             for i, (q, ans) in enumerate(llm_items):
                 result = (
                     llm_attempts[i]
@@ -378,7 +407,7 @@ class QuizEngine:
         return attempts
 
     # ==================================================================
-    # add_to_wrong_book
+    # add_to_wrong_book() — 错题自动收录
     # ==================================================================
 
     async def add_to_wrong_book(
@@ -386,20 +415,19 @@ class QuizEngine:
         attempt: QuizAttempt,
         question: Question | None = None,
     ) -> dict[str, Any]:
-        """Record an incorrect attempt in the wrong-answer notebook.
+        """将错误作答记录到错题本。
 
-        Only records if ``attempt.is_correct`` is ``False``.  If the
-        same question already has a wrong-book entry for this student,
-        ``attempt_count`` is incremented.
+        规则：
+        - 只收录 is_correct=False 的作答
+        - 如果同一学生+同一题目已有错题记录 → 递增 attempt_count
+        - 如果首次答错 → 创建新记录
 
         Args:
-            attempt: The graded ``QuizAttempt``.
-            question: The corresponding ``Question`` (used for
-                ``correct_answer`` when not already available).
+            attempt: 已批改的 QuizAttempt。
+            question: 对应的 Question（用于获取正确答案）。
 
         Returns:
-            The wrong-question record dict as inserted/updated in
-            ``wrong_questions``.
+            dict: 插入/更新后的错题记录。
         """
         if attempt.is_correct is not False:
             logger.debug(
@@ -409,7 +437,7 @@ class QuizEngine:
 
         student_id = getattr(attempt, "student_id", "") or ""
 
-        # Determine the correct answer for reference
+        # 获取正确答案的字符串表示
         correct_answer: str = ""
         if question is not None:
             correct_answer = _serialize_answer(question.correct_answer)
@@ -417,24 +445,24 @@ class QuizEngine:
         now = datetime.now(timezone.utc).isoformat()
         wrong_id = str(uuid4())
 
-        # Check for existing entry (same student + same question)
+        # 检查是否已有此学生+此题的错题记录
         existing = await self._db.get_wrong_question_by_student_and_question(
             student_id, attempt.question_id
         )
 
         if existing is not None:
-            # Increment attempt_count & refresh mutable fields
+            # 已有记录 → 递增 attempt_count + 更新最新错误答案
             new_count = existing.get("attempt_count", 1) + 1
             updates: dict[str, Any] = {
                 "wrong_answer": _serialize_answer(attempt.student_answer or ""),
                 "attempt_count": new_count,
                 "updated_at": now,
             }
-            # Refresh kp_id in case it was previously missing
+            # 如果之前缺少 kp_id，补充
             new_kp_id = getattr(attempt, "kp_id", "") or ""
             if new_kp_id and new_kp_id != existing.get("kp_id", ""):
                 updates["kp_id"] = new_kp_id
-            # Refresh correct_answer when available
+            # 如果正确答案有变化，更新
             if correct_answer and correct_answer != existing.get("correct_answer", ""):
                 updates["correct_answer"] = correct_answer
             await self._db.update_wrong_question(
@@ -450,7 +478,7 @@ class QuizEngine:
             existing["updated_at"] = now
             return existing
 
-        # New entry
+        # 无已有记录 → 创建新错题条目
         record: dict[str, Any] = {
             "wrong_id": wrong_id,
             "student_id": student_id,
@@ -459,7 +487,7 @@ class QuizEngine:
             "wrong_answer": _serialize_answer(attempt.student_answer or ""),
             "correct_answer": correct_answer,
             "attempt_count": 1,
-            "resolution_status": "unresolved",
+            "resolution_status": "unresolved",   # 初始状态：未解决
             "note": "",
             "created_at": now,
             "updated_at": now,
@@ -470,17 +498,25 @@ class QuizEngine:
 
 
 # ==================================================================
-# Internal helpers — grading
+# 内部辅助函数 — 批改
 # ==================================================================
 
 
 def _grade_programmatic(
     question: Question, student_answer: str
 ) -> tuple[bool, float, float]:
-    """Grade a multiple-choice or true/false answer programmatically.
+    """程序批改选择题和判断题（零 LLM 成本）。
+
+    选择题：
+    - 标准化大小写后直接比对 student_answer 和 correct_answer
+    - 正确=1.0分，错误=0.0分
+
+    判断题：
+    - 支持多种 true/false 表示法（中文："对"/"错"/"正确"/"错误"）
+    - 正确=1.0分，错误=0.0分
 
     Returns:
-        (is_correct, score, max_score)
+        tuple: (is_correct, score, max_score)
     """
     if question.type == QuestionType.MULTIPLE_CHOICE:
         student = student_answer.strip().upper()
@@ -490,6 +526,7 @@ def _grade_programmatic(
 
     if question.type == QuestionType.TRUE_FALSE:
         def _to_bool(val: str) -> bool | None:
+            """将各种真/假表示法统一为布尔值。"""
             v = val.strip().lower()
             if v in ("true", "1", "yes", "对", "正确"):
                 return True
@@ -510,7 +547,7 @@ def _grade_programmatic(
             is_correct = student_bool == correct_bool
         return is_correct, 1.0 if is_correct else 0.0, 1.0
 
-    # Fallback — should not reach here
+    # 备用路径 — 不应到达这里
     return False, 0.0, question.points
 
 
@@ -521,16 +558,22 @@ async def _grade_via_llm(
     student_id: str,
     now: str,
 ) -> list[dict[str, Any]]:
-    """Send questions + student answers to the LLM for grading.
+    """调用 LLM 批改非选择题（填空/简答/论述/编程题）。
 
-    Returns a list of result dicts (aligned with ``items``).
+    将所有题目+学生答案打包发送给 LLM（批量调用，节约 API 开销），
+    LLM 按评分标准逐题判定并返回 misconceptions（迷思概念诊断）。
+
+    Returns:
+        list[dict]: 批改结果列表（与 items 顺序一致），
+                    每项包含 is_correct、score、max_score、
+                    analysis、misconceptions、remediation_note。
     """
     try:
         system_prompt = Path(grade_prompt_path).read_text(encoding="utf-8")
     except OSError as exc:
         raise MaterialError(f"无法加载批改提示词: {grade_prompt_path} ({exc})") from exc
 
-    # Build grading context
+    # 构建批改上下文（把所有题目+答案格式化为 LLM 输入）
     lines: list[str] = []
     for idx, (q, ans) in enumerate(items):
         lines.append(f"## 题目 {idx + 1}")
@@ -559,7 +602,7 @@ async def _grade_via_llm(
     try:
         raw = await llm_client.chat(
             messages=messages,
-            temperature=0.1,
+            temperature=0.1,     # 低温保证批改一致性
             max_tokens=4096,
             timeout=120,
         )
@@ -578,7 +621,7 @@ async def _grade_via_llm(
 
 
 def _serialize_answer(answer: Any) -> str:
-    """Convert a question's correct_answer to a JSON string for storage."""
+    """将正确答案序列化为 JSON 字符串，用于错题本存储。"""
     if isinstance(answer, (dict, list)):
         return json.dumps(answer, ensure_ascii=False)
     return str(answer)
@@ -596,7 +639,11 @@ async def _persist_attempt(
     misconceptions: list[dict] | None = None,
     analysis: str = "",
 ) -> QuizAttempt:
-    """Persist a graded answer as a ``QuizAttempt`` in the database."""
+    """将批改结果持久化为 QuizAttempt 记录并写入数据库。
+
+    Returns:
+        QuizAttempt: 包含完整字段的作答记录模型。
+    """
     attempt_id = str(uuid4())
 
     kp_id = question.kp_id
@@ -645,27 +692,48 @@ async def _persist_attempt(
 
 
 # ==================================================================
-# General helpers
+# 通用工具函数
 # ==================================================================
 
 
 def _strip_markdown_fence(raw: str) -> str:
-    """Remove Markdown code fences from an LLM response if present."""
+    """去除 LLM 响应中的 Markdown 代码围栏（```json ... ```）。
+
+    Args:
+        raw: LLM 原始响应文本。
+
+    Returns:
+        str: 去除围栏后的纯 JSON 文本。
+    """
     raw = raw.strip()
     if raw.startswith("```"):
         lines = raw.split("\n")
         if lines[0].startswith("```"):
-            lines = lines[1:]
+            lines = lines[1:]       # 去掉开始的 ```json
         if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
+            lines = lines[:-1]      # 去掉结束的 ```
         raw = "\n".join(lines)
     return raw
 
 
 def _distribute_counts(kp_ids: list[str], count: int) -> dict[str, int]:
-    """Distribute ``count`` items evenly across ``kp_ids``.
+    """将 count 道题目均匀分配到 kp_ids 列表中的各个 KP。
 
-    Remainder items are assigned to the first KPs (round-robin).
+    分配策略：
+    - 每个 KP 至少分配 base = count // n 道题
+    - 余数 remainder = count % n 按顺序分配给前 remainder 个 KP
+
+    例:
+        kp_ids = ["A", "B", "C"], count = 5
+        → base = 1, remainder = 2
+        → {"A": 2, "B": 2, "C": 1}
+
+    Args:
+        kp_ids: 知识点 ID 列表。
+        count: 总题目数。
+
+    Returns:
+        dict[str, int]: kp_id → 题目数量 的映射。
     """
     n = len(kp_ids)
     if n == 0:

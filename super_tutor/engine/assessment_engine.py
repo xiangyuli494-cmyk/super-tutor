@@ -1,13 +1,38 @@
-"""Assessment Engine — 诊断性评估引擎。
+"""诊断性评估引擎 — 基于知识点依赖链的诊断评估。
 
-基于知识点依赖链生成诊断性题目，逐题批改，计算每 KP 掌握度，
-并应用前置规则调整置信度与状态标签。
+【功能说明】
+按知识点依赖链（前驱 → 后继）生成诊断性题目，逐题批改后
+计算每个 KP 的掌握度，并应用 3 条前置规则对评估结果进行校准。
 
-Usage::
+核心流程：
+1. generate(): 从 DB 获取 KP → 拓扑排序 → 分配题目数 → LLM 生成诊断性题目
+2. grade(): 委托 QuizEngine 批改 → 按 KP 分组 → 计算准确率 → 应用 3 条规则
+3. apply_prerequisite_rules(): 3 条纯 Python 规则（不调用 LLM）
 
-    engine = AssessmentEngine(db, llm_client)
-    questions = await engine.generate(["kp-001", "kp-002", "kp-003"])
-    report = await engine.grade(questions, student_answers)
+3 条前置规则（系统的核心诊断逻辑）：
+
+【规则1 — 置信度折扣】（Confidence Discount）
+前驱知识点 mastery ≤ 0.5 → 后继的 confidence × 0.7
+含义：前驱没掌握却答对后继 → 可能是猜测，降低后继置信度
+
+【规则2 — 需要复习】（Need Review）
+后继 accuracy ≥ 0.6 但前驱 accuracy < 0.5 → 标记前驱为 need_review
+含义：学生"看起来"掌握了后继但前驱却错了 → 前驱基础不扎实
+
+【规则3 — 需要重学】（Need Relearn）
+某个 KP 的 ≥3 个直接后继全部 accuracy < 0.5 → 标记此 KP 为 need_relearn
+含义：多个后继都错了 → 此 KP 的教学可能存在问题，掌握度折半
+
+题目数量分配策略：
+每个 KP 至少 1 道题，余数从链尾（后继 KP）开始分配（后继需要更多诊断深度）
+
+【耦合关系】
+- 依赖 Database（KP 和题目 CRUD）、LLMClient（LLM 出题）
+- 依赖 KnowledgeEngine（KP 查询和关系解析）
+- 依赖 QuizEngine（委托批改和错题收录）
+- 被 app.py 的诊断评估 Tab 调用
+- 输出 AssessmentReport 供 PlanEngine 使用
+- 使用 prompts/assessment.md（诊断性评估提示词）
 """
 
 from __future__ import annotations
@@ -30,7 +55,7 @@ from super_tutor.models.quiz import Question
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# 默认 prompt 路径
+# 默认 prompt 路径 — 诊断性评估提示词
 # ---------------------------------------------------------------------------
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 _DEFAULT_ASSESSMENT_PROMPT = _PROMPTS_DIR / "assessment.md"
@@ -39,9 +64,11 @@ _DEFAULT_ASSESSMENT_PROMPT = _PROMPTS_DIR / "assessment.md"
 class AssessmentEngine:
     """诊断性评估引擎。
 
-    按知识点依赖链（前驱 → 后继）生成诊断性题目，
-    批改后计算每个 KP 的掌握度，并应用三条前置规则
-    对评估结果进行校准。
+    与普通 QuizEngine 的区别：
+    - 题目按 KP 依赖链递进难度（链首简单 → 链尾困难）
+    - 选择题干扰项标注 diagnostic_tags（可诊断的迷思概念类型）
+    - 批改后应用 3 条前置规则校准掌握度
+    - 输出 AssessmentReport（而非单纯的正确/错误）
 
     Usage::
 
@@ -58,18 +85,14 @@ class AssessmentEngine:
         quiz_engine: QuizEngine | None = None,
         assessment_prompt_path: str | None = None,
     ) -> None:
-        """Initialise the assessment engine.
+        """初始化诊断性评估引擎。
 
         Args:
-            db: An initialised ``Database`` instance.
-            llm_client: An ``LLMClient`` instance for LLM calls.
-            knowledge_engine: Optional pre-built ``KnowledgeEngine``.
-                If omitted, one is created from *db* + *llm_client*.
-            quiz_engine: Optional pre-built ``QuizEngine``.
-                If omitted, one is created from *db* + *llm_client* +
-                *knowledge_engine*.
-            assessment_prompt_path: Optional path to a custom assessment
-                prompt template.  Defaults to ``prompts/assessment.md``.
+            db: 已初始化的 Database 实例。
+            llm_client: LLMClient 实例。
+            knowledge_engine: 可选的预建 KnowledgeEngine（缺省时自动创建）。
+            quiz_engine: 可选的预建 QuizEngine（缺省时自动创建）。
+            assessment_prompt_path: 可选的自定义评估提示词路径。
         """
         self._db = db
         self._llm = llm_client
@@ -86,7 +109,7 @@ class AssessmentEngine:
         )
 
     # ==================================================================
-    # Generate — 生成诊断性评估题目
+    # generate() — 生成诊断性评估题目
     # ==================================================================
 
     async def generate(
@@ -95,25 +118,20 @@ class AssessmentEngine:
         student_id: str = "",
         question_count: int = 15,
     ) -> list[Question]:
-        """Generate diagnostic assessment questions for a KP chain.
+        """生成一套诊断性评估题目。
 
-        Each KP receives at least 1 question.  Questions are ordered
-        from prerequisites to successors, forming a progressive
-        assessment that can detect prerequisite gaps.
+        每个 KP 至少 1 道题，按拓扑序从基础到高级递进布置。
 
         Args:
-            kp_ids: Knowledge point IDs to assess.  Must be non-empty.
-            student_id: Student identifier (unused in generation, but
-                stored in metadata).
-            question_count: Total number of questions.  Must be
-                >= len(*kp_ids*).
+            kp_ids: 要评估的知识点 ID 列表。
+            student_id: 学生标识。
+            question_count: 总题目数（必须 ≥ KP 数量）。
 
         Returns:
-            A list of ``Question`` objects in topological (dependency) order.
+            Question 列表（按拓扑/依赖顺序排列）。
 
         Raises:
-            ValueError: If *kp_ids* is empty or *question_count* is
-                less than the number of KPs.
+            ValueError: kp_ids 为空或 question_count < KP 数量。
         """
         if not kp_ids:
             raise ValueError("kp_ids 不能为空")
@@ -123,7 +141,7 @@ class AssessmentEngine:
                 f"知识点数量 ({len(kp_ids)})"
             )
 
-        # -- 1. Fetch KPs & topological sort ---------------------------------
+        # -- 第 1 步：获取 KP 并进行拓扑排序 ---------------------------------
         kp_map: dict[str, dict] = {}
         for kid in kp_ids:
             row = await self._db.get_knowledge_point(kid)
@@ -137,10 +155,10 @@ class AssessmentEngine:
 
         ordered_ids = self._topological_sort(kp_map)
 
-        # -- 2. Distribute question counts ------------------------------------
+        # -- 第 2 步：分配题目数量（每个 KP 至少 1 道） ----------------------
         per_kp_count = self._distribute_counts(ordered_ids, question_count)
 
-        # -- 3. Build KP context for LLM --------------------------------------
+        # -- 第 3 步：构建 KP 上下文（供 LLM 出题参考） -----------------------
         kp_context_parts: list[str] = []
         for i, kid in enumerate(ordered_ids):
             kp = kp_map[kid]
@@ -165,7 +183,7 @@ class AssessmentEngine:
                 f"- 需要出题数量: {per_kp_count.get(kid, 1)} 道\n"
             )
 
-        # -- 4. Load system prompt & call LLM ---------------------------------
+        # -- 第 4 步：加载系统提示词并调用 LLM --------------------------------
         try:
             system_prompt = Path(self._prompt_path).read_text(encoding="utf-8")
         except OSError as exc:
@@ -194,12 +212,12 @@ class AssessmentEngine:
 
         raw = await self._llm.chat(
             messages=messages,
-            temperature=0.7,
+            temperature=0.7,     # 中等温度保证题目多样性
             max_tokens=8192,
             timeout=180,
         )
 
-        # -- 5. Parse LLM response --------------------------------------------
+        # -- 第 5 步：解析 LLM 响应 --------------------------------------------
         raw = self._strip_markdown_fence(raw)
         try:
             data = json.loads(raw)
@@ -213,7 +231,7 @@ class AssessmentEngine:
         if not question_dicts:
             raise RuntimeError("LLM 未返回任何评估题目")
 
-        # -- 6. Build Question models & persist -------------------------------
+        # -- 第 6 步：构建 Question 模型并持久化 ------------------------------
         questions: list[Question] = []
         now = datetime.now(timezone.utc).isoformat()
         for qd in question_dicts:
@@ -251,7 +269,7 @@ class AssessmentEngine:
         return questions
 
     # ==================================================================
-    # Grade — 批改 + 掌握度计算 + 前置规则
+    # grade() — 批改 + 掌握度计算 + 前置规则校准
     # ==================================================================
 
     async def grade(
@@ -260,36 +278,37 @@ class AssessmentEngine:
         student_answers: list[dict],
         student_id: str = "",
     ) -> AssessmentReport:
-        """Grade assessment answers and produce a mastery report.
+        """批改评估答案并生成掌握度报告。
 
-        Each answer is graded via the QuizEngine, then results are
-        aggregated per knowledge point.  Mastery levels are computed
-        and calibrated through prerequisite rules.
+        完整流程（6 步）：
+        1. 委托 QuizEngine.grade_answers() 批改每道题
+        2. 将错题自动收录到错题本
+        3. 按 kp_id 分组作答记录
+        4. 逐 KP 计算准确率 → 初始掌握度
+        5. 应用 3 条前置规则校准（apply_prerequisite_rules）
+        6. 填充 weak_kps 和 strong_kps 列表
 
         Args:
-            questions: The ``Question`` objects that were presented.
-            student_answers: A list of ``{"question_id": str,
-                "student_answer": Any, "time_spent_seconds": int}``
-                dicts, one per answer submitted.
-            student_id: The student being assessed.
+            questions: 评估题目列表。
+            student_answers: 学生答案列表。
+            student_id: 学生标识。
 
         Returns:
-            An ``AssessmentReport`` with per-KP results, warnings,
-            and overall statistics.
+            AssessmentReport: 包含所有 KP 的校准后掌握度和诊断状态。
         """
         if not questions:
             raise ValueError("questions 不能为空")
         if not student_answers:
             raise ValueError("student_answers 不能为空")
 
-        # -- 1. Delegate per-question grading to QuizEngine -------------------
+        # -- 第 1 步：委托 QuizEngine 批改 ------------------------------------
         attempts = await self._quiz_engine.grade_answers(
             questions=questions,
             student_answers=student_answers,
             student_id=student_id,
         )
 
-        # -- 1a. Persist wrong answers to wrong book --------------------------
+        # -- 第 2 步：错题自动收录到错题本 ------------------------------------
         q_map = {q.question_id: q for q in questions}
         wrong_book_failures: list[str] = []
         for attempt in attempts:
@@ -306,7 +325,7 @@ class AssessmentEngine:
                     )
                     wrong_book_failures.append(attempt.question_id)
 
-        # -- 2. Group attempts by kp_id ---------------------------------------
+        # -- 第 3 步：按 kp_id 分组作答记录 -----------------------------------
         kp_attempts: dict[str, list] = {}
         for attempt in attempts:
             kp_id = attempt.kp_id or q_map.get(attempt.question_id, Question()).kp_id
@@ -314,9 +333,9 @@ class AssessmentEngine:
                 kp_id = "__unknown__"
             kp_attempts.setdefault(kp_id, []).append(attempt)
 
-        # -- 3. Build KP assessment results -----------------------------------
+        # -- 第 4 步：构建每个 KP 的评估结果 ----------------------------------
         kp_results: list[KPAssessmentResult] = []
-        # Determine KP order from the questions' kp_ids (topological)
+        # 保持题目中的 KP 顺序（拓扑序）
         seen_kps: dict[str, None] = {}
         ordered_kp_ids: list[str] = []
         for q in questions:
@@ -331,7 +350,7 @@ class AssessmentEngine:
             total = len(kp_att)
             accuracy = round(correct / total, 4) if total > 0 else 0.0
 
-            # Fetch KP info for title and prerequisite/successor IDs
+            # 获取 KP 信息（标题、前置/后继 ID）
             kp_row = await self._db.get_knowledge_point(kp_id) if kp_id != "__unknown__" else None
             title = kp_row.get("title", kp_id) if kp_row else kp_id
             prereq_ids = _parse_json_list(
@@ -341,7 +360,7 @@ class AssessmentEngine:
                 kp_row.get("successor_ids", "[]")
             ) if kp_row else []
 
-            # Initial mastery = accuracy (simple model for assessment)
+            # 初始掌握度 = 准确率（在评估中，答对 = 掌握）
             initial_mastery = accuracy
 
             kp_results.append(
@@ -355,11 +374,11 @@ class AssessmentEngine:
                     total_count=total,
                     accuracy=accuracy,
                     initial_mastery=initial_mastery,
-                    adjusted_mastery=initial_mastery,  # calibrated below
+                    adjusted_mastery=initial_mastery,  # 下面由规则校准
                 )
             )
 
-        # -- 4. Build preliminary report --------------------------------------
+        # -- 第 5 步：构建初步报告并应用 3 条前置规则 ------------------------
         correct_total = sum(r.correct_count for r in kp_results)
         question_total = sum(r.total_count for r in kp_results)
 
@@ -381,18 +400,18 @@ class AssessmentEngine:
             warnings=warnings,
         )
 
-        # -- 5. Apply prerequisite rules --------------------------------------
+        # 应用 3 条前置规则（纯 Python 逻辑，不调用 LLM）
         self.apply_prerequisite_rules(report)
 
-        # -- 6. Populate weak/strong KP lists ---------------------------------
+        # -- 第 6 步：填充 weak_kps 和 strong_kps 列表 -----------------------
         report.weak_kps = sorted(
             [r for r in report.kp_results if r.adjusted_mastery <= 0.5],
-            key=lambda r: r.adjusted_mastery,
+            key=lambda r: r.adjusted_mastery,  # 掌握度升序（最弱的在前）
         )
         report.strong_kps = sorted(
             [r for r in report.kp_results if r.adjusted_mastery >= 0.8],
             key=lambda r: r.adjusted_mastery,
-            reverse=True,
+            reverse=True,  # 掌握度降序（最强的在前）
         )
 
         logger.info(
@@ -407,42 +426,35 @@ class AssessmentEngine:
         return report
 
     # ==================================================================
-    # Prerequisite Rules
+    # apply_prerequisite_rules() — 3 条前置规则（核心诊断逻辑）
+    #     纯 Python 实现，不调用 LLM，就地修改 report
     # ==================================================================
 
     def apply_prerequisite_rules(self, report: AssessmentReport) -> None:
-        """Apply three prerequisite calibration rules to the report.
+        """应用 3 条前置校准规则到评估报告（就地修改）。
 
-        Modifies *report* in-place:
-
-        **Rule 1 — Confidence Discount**
-        如果前驱知识点掌握度 ≤ 0.5，其后继知识点的置信度乘以 0.7。
-        这反映了一个事实：后继答对可能是猜测，因为前驱基础尚未牢固。
-
-        **Rule 2 — Need Review**
-        如果后继知识点答对了但前驱知识点答错了，
-        将前驱标记为 ``need_review``。
-        这识别了"看似理解但不扎实"的情况。
-
-        **Rule 3 — Need Relearn**
-        如果某个知识点的 ≥3 个直接后继都答错了，
-        将该前驱标记为 ``need_relearn``。
-        这说明前驱知识的教学可能存在问题。
+        规则设计原理：知识学习是分层的（DAG），后继的正确理解
+        依赖于前驱的扎实掌握。因此：
+        - 前驱薄弱但后继做对 → 后继可能是猜测（Rule 1）
+        - 后继做对但前驱做错 → 前驱需要复习（Rule 2）
+        - 前驱的多个后继全错 → 前驱教学可能有问题（Rule 3）
 
         Args:
-            report: The ``AssessmentReport`` to calibrate in-place.
+            report: 待校准的 AssessmentReport（就地修改）。
         """
         if not report.kp_results:
             return
 
-        # Build lookup by kp_id
+        # 构建 kp_id → 评估结果的快速查找表
         kp_by_id: dict[str, KPAssessmentResult] = {
             r.kp_id: r for r in report.kp_results
         }
 
         rules_applied: list[str] = []
 
-        # ---- Rule 1: Confidence Discount -----------------------------------
+        # ---- 规则1：置信度折扣 -----------------------------------------------
+        # 如果前驱 KP 的掌握度 ≤ 0.5，后继的置信度乘以 0.7
+        # 原因：前驱没掌握却答对后继 → 可能是猜测，降低置信度
         for r in report.kp_results:
             for prereq_id in r.prerequisite_ids:
                 prereq = kp_by_id.get(prereq_id)
@@ -464,10 +476,11 @@ class AssessmentEngine:
                     rules_applied.append(msg)
                     logger.info(msg)
 
-        # ---- Rule 2: Need Review — successor correct but prerequisite wrong
+        # ---- 规则2：需要复习 -------------------------------------------------
+        # 后继 KP 做对了（accuracy ≥ 0.6），但其某个前驱做错了（accuracy < 0.5）
+        # → 标记该前驱为 need_review（表面掌握但不扎实）
         for r in report.kp_results:
             if r.accuracy >= 0.6 and r.status not in ("need_review", "need_relearn"):
-                # This KP did well; check its prerequisites
                 for prereq_id in r.prerequisite_ids:
                     prereq = kp_by_id.get(prereq_id)
                     if prereq is None:
@@ -487,7 +500,9 @@ class AssessmentEngine:
                         rules_applied.append(msg)
                         logger.info(msg)
 
-        # ---- Rule 3: Need Relearn — ≥3 direct successors all wrong ----------
+        # ---- 规则3：需要重学 -------------------------------------------------
+        # 某个 KP 的 ≥3 个直接后继全部答错（accuracy < 0.5）
+        # → 标记此 KP 为 need_relearn，掌握度折半
         for r in report.kp_results:
             failed_successors: list[KPAssessmentResult] = []
             for succ_id in r.successor_ids:
@@ -512,7 +527,7 @@ class AssessmentEngine:
                 rules_applied.append(msg)
                 logger.info(msg)
 
-        # ---- Final status assignment for unlabelled KPs ---------------------
+        # ---- 最终状态赋值：未标记的 KP 按掌握度分级 -------------------------
         for r in report.kp_results:
             if r.status not in (
                 "need_review",
@@ -521,34 +536,33 @@ class AssessmentEngine:
                 "learning",
             ):
                 if r.adjusted_mastery >= 0.8:
-                    r.status = "mastered"
+                    r.status = "mastered"    # 掌握度 ≥ 0.8 → 已掌握
                 elif r.adjusted_mastery >= 0.5:
-                    r.status = "learning"
+                    r.status = "learning"    # 0.5 ≤ mastery < 0.8 → 学习中
                 else:
-                    r.status = "need_relearn"
+                    r.status = "need_relearn"  # mastery < 0.5 → 需要重新学习
 
         report.rules_applied = rules_applied
 
     # ==================================================================
-    # Helpers
+    # 辅助方法
     # ==================================================================
 
     def _topological_sort(self, kp_map: dict[str, dict]) -> list[str]:
-        """Kahn's algorithm topological sort of KPs by prerequisites.
+        """Kahn 算法拓扑排序 — 按前置依赖关系排列知识点。
 
-        KPs with no prerequisites (or prerequisites outside the set)
-        come first; their successors follow in dependency order.
+        与 PlanEngine.topological_sort() 逻辑一致，
+        独立实现以避免模块间耦合。
 
         Args:
-            kp_map: Mapping of kp_id → DB row dict (must contain
-                ``prerequisite_ids`` as JSON string or list).
+            kp_map: kp_id → DB 行字典 的映射。
 
         Returns:
-            Ordered list of kp_ids.
+            list[str]: 拓扑排序后的 kp_id 列表。
         """
         kp_ids = set(kp_map.keys())
 
-        # Build adjacency list and in-degree map
+        # 构建邻接表和入度表（方向：前置 → 后继）
         adj: dict[str, list[str]] = {k: [] for k in kp_ids}
         in_degree: dict[str, int] = {k: 0 for k in kp_ids}
 
@@ -559,7 +573,7 @@ class AssessmentEngine:
                     adj.setdefault(pid, []).append(kid)
                     in_degree[kid] = in_degree.get(kid, 0) + 1
 
-        # Kahn's algorithm
+        # Kahn 算法
         queue: deque[str] = deque(
             k for k in kp_ids if in_degree.get(k, 0) == 0
         )
@@ -573,7 +587,7 @@ class AssessmentEngine:
                 if in_degree[neighbor] == 0:
                     queue.append(neighbor)
 
-        # Append remaining nodes (cycle or orphan references)
+        # 追加剩余节点（环或孤立引用）
         for k in kp_ids:
             if k not in result:
                 result.append(k)
@@ -585,14 +599,16 @@ class AssessmentEngine:
         ordered_ids: list[str],
         total: int,
     ) -> dict[str, int]:
-        """Distribute *total* questions across KPs, min 1 each.
+        """将 total 道题目分配给各 KP，每个至少 1 道。
+
+        余数按轮询方式从链尾开始分配（后继 KP 需要更多诊断深度）。
 
         Args:
-            ordered_ids: KPs in topological order.
-            total: Total number of questions.
+            ordered_ids: 拓扑排序后的 KP ID 列表。
+            total: 总题目数。
 
         Returns:
-            Mapping of kp_id → question count.
+            dict[str, int]: kp_id → 题目数量 的映射。
         """
         n = len(ordered_ids)
         if n == 0:
@@ -601,10 +617,8 @@ class AssessmentEngine:
         per_kp: dict[str, int] = {k: 1 for k in ordered_ids}
         remaining = total - n
 
-        # Distribute remaining questions evenly, weighted slightly toward
-        # later KPs in the chain (which need more diagnostic depth)
+        # 余数按轮询分配，从链尾开始（后继 KP 优先获得额外题目）
         for i in range(remaining):
-            # Round-robin starting from the end (successors get extra)
             idx = i % n
             per_kp[ordered_ids[idx]] += 1
 
@@ -612,13 +626,13 @@ class AssessmentEngine:
 
     @staticmethod
     def _strip_markdown_fence(raw: str) -> str:
-        """Remove ``` fences from an LLM JSON response."""
+        """去除 LLM 响应中的 Markdown 代码围栏。"""
         raw = raw.strip()
         if raw.startswith("```"):
             lines = raw.split("\n")
             if lines[0].startswith("```"):
-                lines = lines[1:]
+                lines = lines[1:]       # 去掉开始的 ```json
             if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
+                lines = lines[:-1]      # 去掉结束的 ```
             raw = "\n".join(lines)
         return raw.strip()

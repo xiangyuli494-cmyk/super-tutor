@@ -1,21 +1,37 @@
-"""Socratic Engine — 苏格拉底式引导追问引擎。
+"""苏格拉底式引导引擎 — 基于错题的启发式追问教学。
 
-基于错题和知识点内容，通过层层递进的引导性问题帮助学生
-自主发现正确答案，而非直接告知。
+【功能说明】
+基于错题和知识点内容，通过层层递进的引导性问题帮助学生自主发现正确答案，
+而非直接告知。模仿苏格拉底教学法"产婆术"。
 
-状态机（会话级，仅存 ``st.session_state``，不持久化到 DB）::
+状态机（5 级层级，LLM 驱动 + Python 安全阀）：
 
-    L1_GUIDING → L2_HINTING → L3_NEAR_ANSWER → RESOLVED
-         ↓            ↓              ↓
-         └────────────┴──────────────┴──→ SHOW_ANSWER
+    start_dialogue → L1_GUIDING (笼统引导)
+                         ↓
+                    学生回答
+                         ↓
+                    LLM 判断 → L2_HINTING (具体提示)
+                                   ↓
+                              学生回答
+                                   ↓
+                              LLM 判断 → L3_NEAR_ANSWER (接近答案)
+                                             ↓
+                                         RESOLVED (已解决) ← 学生展示理解
+                                         SHOW_ANSWER (显示答案) ← 学生请求/超限
 
-Usage::
+两个 Python 安全阀（在 LLM 调用前拦截）：
+1. 关键词检测（_is_show_answer_request）:
+   15 个中英文触发词 → 直接进入 SHOW_ANSWER 路径
+2. 最大轮数限制（_MAX_DIALOGUE_TURNS = 6）:
+   超过 6 轮 → 强制执行 _force_show_answer（LLM 输出 SHOW_ANSWER）
 
-    engine = SocraticEngine(db, llm_client)
-    turn = await engine.start_dialogue("kp-001", "wrong-001")
-    # ... user responds ...
-    history = [build_history_entry(turn, user_response)]
-    next_turn = await engine.continue_dialogue(history, user_response)
+对话状态仅保存在 st.session_state，不持久化到数据库。
+
+【耦合关系】
+- 依赖 Database（获取 KP 和错题数据）、LLMClient（LLM 引导生成）
+- 被 app.py 的错题本 Tab 中苏格拉底追问功能调用
+- 使用 models/socratic.py 的 SocraticTurn 模型和工具函数
+- 使用 prompts/socratic.md（苏格拉底教学系统提示词）
 """
 
 from __future__ import annotations
@@ -41,22 +57,26 @@ from super_tutor.models.socratic import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Default prompt path
+# 默认 prompt 路径 — 苏格拉底教学系统提示词
 # ---------------------------------------------------------------------------
 _PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
 _DEFAULT_SOCRATIC_PROMPT = _PROMPTS_DIR / "socratic.md"
 
 # ---------------------------------------------------------------------------
-# Constants
+# 常量
 # ---------------------------------------------------------------------------
-_MAX_DIALOGUE_TURNS = 6  # 超过此轮数自动升级到 SHOW_ANSWER
+_MAX_DIALOGUE_TURNS = 6  # 超过此轮数自动升级到 SHOW_ANSWER（安全阀2）
 
 
 class SocraticEngine:
     """苏格拉底式引导追问引擎。
 
-    封装了错题上下文获取、LLM 引导生成和层级状态管理。
-    对话状态仅保存在 ``st.session_state`` 中，不写入数据库。
+    核心设计理念：教师不直接告知答案，而是通过问题链引导学生
+    自主推理和发现正确答案。这种教学法的关键在于：
+    1. 从学生的当前认知水平出发（L1）
+    2. 逐步缩小问题范围（L1 → L2 → L3）
+    3. 在学生顿悟时及时确认（RESOLVED）
+    4. 在必要时给予完整解析（SHOW_ANSWER）
 
     Usage::
 
@@ -73,20 +93,19 @@ class SocraticEngine:
         llm_client: LLMClient,
         prompt_path: Optional[str] = None,
     ) -> None:
-        """Initialise the Socratic engine.
+        """初始化苏格拉底引擎。
 
         Args:
-            db: An initialised ``Database`` instance.
-            llm_client: An ``LLMClient`` instance for LLM calls.
-            prompt_path: Optional custom prompt path (defaults to
-                ``prompts/socratic.md``).
+            db: 已初始化的 Database 实例。
+            llm_client: LLMClient 实例。
+            prompt_path: 可选的自定义提示词路径（默认 prompts/socratic.md）。
         """
         self._db = db
         self._llm = llm_client
         self._prompt_path = prompt_path or str(_DEFAULT_SOCRATIC_PROMPT)
 
     # ==================================================================
-    # start_dialogue — 开始新对话
+    # start_dialogue() — 开始新对话（入口）
     # ==================================================================
 
     async def start_dialogue(
@@ -94,33 +113,33 @@ class SocraticEngine:
         kp_id: str,
         wrong_question_id: str,
     ) -> SocraticTurn:
-        """Start a new Socratic dialogue for a wrong question.
+        """开始一轮新的苏格拉底对话。
 
-        Fetches the knowledge point and wrong-question record from the
-        database, builds the context prompt, and calls the LLM to
-        generate an **L1_GUIDING** opening question.
+        流程：
+        1. 从 DB 获取 KP 内容和错题记录（含原始题目信息）
+        2. 构建对话启动 prompt（含 KP 内容、错题信息、正确答案）
+        3. 调用 LLM，要求从 L1_GUIDING 层级开始引导
 
         Args:
-            kp_id: The knowledge point ID.
-            wrong_question_id: The wrong-question record ID.
+            kp_id: 知识点 ID。
+            wrong_question_id: 错题记录 ID（wrong_questions 表）。
 
         Returns:
-            A ``SocraticTurn`` with ``level=L1_GUIDING``.
+            SocraticTurn: level=L1_GUIDING 的首轮引导消息。
 
         Raises:
-            MaterialError: If the KP or wrong question is not found,
-                or if the LLM returns an invalid response.
+            MaterialError: KP 或错题记录不存在，或 LLM 返回无效响应。
         """
-        # -- 1. Fetch context data --------------------------------------------
+        # -- 第 1 步：获取上下文数据 ------------------------------------------
         kp_data, wrong_data = await self._fetch_context(kp_id, wrong_question_id)
 
-        # -- 2. Build user prompt ---------------------------------------------
+        # -- 第 2 步：构建启动 prompt -----------------------------------------
         user_prompt = self._build_start_prompt(kp_data, wrong_data)
 
-        # -- 3. Call LLM ------------------------------------------------------
+        # -- 第 3 步：调用 LLM ------------------------------------------------
         raw_json = await self._call_llm(user_prompt)
 
-        # -- 4. Parse & return ------------------------------------------------
+        # -- 第 4 步：解析并返回 ----------------------------------------------
         turn = self._parse_turn(raw_json, kp_id, wrong_question_id)
 
         logger.info(
@@ -133,7 +152,7 @@ class SocraticEngine:
         return turn
 
     # ==================================================================
-    # continue_dialogue — 继续对话
+    # continue_dialogue() — 继续对话（核心状态机）
     # ==================================================================
 
     async def continue_dialogue(
@@ -141,35 +160,34 @@ class SocraticEngine:
         history: list[dict[str, Any]],
         user_response: str,
     ) -> SocraticTurn:
-        """Continue an ongoing Socratic dialogue.
+        """继续苏格拉底对话。
 
-        Evaluates the student's response against the dialogue history
-        and decides whether to escalate (L1→L2→L3), de-escalate,
-        resolve, or show the answer.
+        这是状态机的核心方法，根据学生回答和历史对话决定下一层级。
+        决策顺序（优先级从高到低）：
+
+        1. 关键词检测 → 学生说"显示答案"等 → SHOW_ANSWER（Python 安全阀1）
+        2. 轮数检测 → 超过 6 轮 → 强制 SHOW_ANSWER（Python 安全阀2）
+        3. LLM 决策 → 将历史+学生回答发给 LLM，由 LLM 判断下一层级
 
         Args:
-            history: Previous dialogue turns (each a dict from
-                ``build_history_entry()``).  Must contain at least one
-                entry with ``kp_id`` and ``wrong_question_id``.
-            user_response: The student's latest response text.
+            history: 对话历史列表（build_history_entry() 返回的格式）。
+            user_response: 学生本次的回答文本。
 
         Returns:
-            A ``SocraticTurn`` with the next teacher message and
-            updated level.
+            SocraticTurn: 下一轮教师引导消息。
 
         Raises:
-            ValueError: If *history* is empty.
-            MaterialError: If the context cannot be fetched or the LLM
-                returns an invalid response.
+            ValueError: history 为空。
+            MaterialError: 上下文获取失败或 LLM 返回无效响应。
         """
         if not history:
             raise ValueError("history 不能为空")
 
-        # -- 1. Check for explicit "show answer" request ---------------------
+        # -- 安全阀1：检测学生是否明确要求显示答案 -------------------------
         if self._is_show_answer_request(user_response):
             return self._build_show_answer_turn(history)
 
-        # -- 2. Check for max turns exceeded ---------------------------------
+        # -- 安全阀2：检测是否超过最大轮数 ---------------------------------
         if len(history) >= _MAX_DIALOGUE_TURNS:
             logger.info(
                 "Max dialogue turns (%d) reached — escalating to SHOW_ANSWER",
@@ -177,25 +195,25 @@ class SocraticEngine:
             )
             return await self._force_show_answer(history, user_response)
 
-        # -- 3. Extract context from first history entry ----------------------
+        # -- 正常流程：从 history 中提取上下文 ---------------------------------
         kp_id = history[0].get("kp_id", "")
         wrong_question_id = history[0].get("wrong_question_id", "")
 
         if not kp_id or not wrong_question_id:
             raise ValueError("history[0] 缺少 kp_id 或 wrong_question_id")
 
-        # -- 4. Fetch context data -------------------------------------------
+        # -- 获取上下文数据 ---------------------------------------------------
         kp_data, wrong_data = await self._fetch_context(kp_id, wrong_question_id)
 
-        # -- 5. Build user prompt with history --------------------------------
+        # -- 构建继续对话 prompt（含完整历史）----------------------------------
         user_prompt = self._build_continue_prompt(
             kp_data, wrong_data, history, user_response
         )
 
-        # -- 6. Call LLM ------------------------------------------------------
+        # -- 调用 LLM（由 LLM 判断下一层级）----------------------------------
         raw_json = await self._call_llm(user_prompt)
 
-        # -- 7. Parse & return ------------------------------------------------
+        # -- 解析并返回 -------------------------------------------------------
         turn = self._parse_turn(raw_json, kp_id, wrong_question_id)
 
         logger.info(
@@ -207,24 +225,34 @@ class SocraticEngine:
         return turn
 
     # ==================================================================
-    # Internal: context fetching
+    # 内部方法：上下文获取
     # ==================================================================
 
     async def _fetch_context(
         self, kp_id: str, wrong_question_id: str
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Fetch KP and wrong-question data, raising on missing records."""
-        # KP
+        """从数据库获取 KP 和错题数据，并丰富题目信息。
+
+        获取的数据用于构建 LLM prompt：
+        - KP: 标题、难度、内容
+        - 错题: 学生错误答案、正确答案
+        - 原始题目: 题干、解析、题目类型
+
+        Returns:
+            tuple: (kp_data, wrong_data)。wrong_data 被丰富后增加了
+                   _question_stem、_question_explanation、_question_type 字段。
+        """
+        # 获取知识点
         kp_data = await self._db.get_knowledge_point(kp_id)
         if kp_data is None:
             raise MaterialError(f"知识点不存在: {kp_id}")
 
-        # Wrong question — may also need the original question for stem
+        # 获取错题记录
         wrong_data = await self._db.get_wrong_question(wrong_question_id)
         if wrong_data is None:
             raise MaterialError(f"错题记录不存在: {wrong_question_id}")
 
-        # Enrich with question stem if available
+        # 丰富错题数据：从 questions 表获取原始题目信息
         question_id = wrong_data.get("question_id", "")
         if question_id:
             q_row = await self._db.get_question(question_id)
@@ -236,7 +264,7 @@ class SocraticEngine:
         return kp_data, wrong_data
 
     # ==================================================================
-    # Internal: prompt building
+    # 内部方法：prompt 构建
     # ==================================================================
 
     @staticmethod
@@ -244,7 +272,11 @@ class SocraticEngine:
         kp_data: dict[str, Any],
         wrong_data: dict[str, Any],
     ) -> str:
-        """Build the user prompt for ``start_dialogue``."""
+        """构建 start_dialogue 的 LLM 用户 prompt。
+
+        包含：知识点信息、错题信息（题干+学生答案+正确答案+解析）
+        末尾指示 LLM 从 L1_GUIDING 开始。
+        """
         lines = [
             "## 知识点",
             f"- 标题: {kp_data.get('title', '')}",
@@ -274,7 +306,13 @@ class SocraticEngine:
         history: list[dict[str, Any]],
         user_response: str,
     ) -> str:
-        """Build the user prompt for ``continue_dialogue``."""
+        """构建 continue_dialogue 的 LLM 用户 prompt。
+
+        在启动 prompt 基础上增加：
+        - 对话历史（格式化后的教师-学生多轮对话）
+        - 学生本轮回应
+        - 指示 LLM 判断下一层级
+        """
         lines = [
             "## 知识点",
             f"- 标题: {kp_data.get('title', '')}",
@@ -304,25 +342,23 @@ class SocraticEngine:
         return "\n".join(lines)
 
     # ==================================================================
-    # Internal: LLM call
+    # 内部方法：LLM 调用
     # ==================================================================
 
     async def _call_llm(
         self, user_prompt: str
     ) -> str:
-        """Call the LLM with the socratic system prompt and user context.
+        """调用 LLM 进行苏格拉底式引导生成。
+
+        加载系统提示词（prompts/socratic.md）→ 发送用户 prompt →
+        返回原始 LLM 响应（JSON 字符串）。
 
         Args:
-            user_prompt: The formatted user prompt.
+            user_prompt: 格式化的用户 prompt。
 
         Returns:
-            Raw LLM response text (JSON string).
-
-        Raises:
-            MaterialError: If the prompt file cannot be loaded or the
-                LLM call fails.
+            str: LLM 原始响应（JSON 格式，待解析）。
         """
-        # Load system prompt
         try:
             system_prompt = Path(self._prompt_path).read_text(encoding="utf-8")
         except OSError as exc:
@@ -338,8 +374,8 @@ class SocraticEngine:
         try:
             raw = await self._llm.chat(
                 messages=messages,
-                temperature=0.7,
-                max_tokens=2048,
+                temperature=0.7,     # 中等温度保持引导自然度
+                max_tokens=2048,     # 教师消息通常不长
                 timeout=120,
             )
         except LLMError as exc:
@@ -348,7 +384,7 @@ class SocraticEngine:
         return _strip_markdown_fence(raw)
 
     # ==================================================================
-    # Internal: parse & helpers
+    # 内部方法：解析和辅助
     # ==================================================================
 
     def _parse_turn(
@@ -357,10 +393,13 @@ class SocraticEngine:
         kp_id: str,
         wrong_question_id: str,
     ) -> SocraticTurn:
-        """Parse LLM JSON response into a ``SocraticTurn``.
+        """解析 LLM 返回的 JSON → SocraticTurn 模型。
+
+        必填字段：level、teacher_message
+        可选字段：expected_concepts、reasoning、resolved、resolution_note
 
         Raises:
-            MaterialError: If the JSON is invalid or missing required fields.
+            MaterialError: JSON 无效或缺少 teacher_message。
         """
         try:
             data = json.loads(raw_json)
@@ -385,13 +424,26 @@ class SocraticEngine:
             expected_concepts=data.get("expected_concepts", []),
             reasoning=data.get("reasoning", ""),
             resolved=data.get("resolved", False)
-                or level in (RESOLVED, SHOW_ANSWER),
+                or level in (RESOLVED, SHOW_ANSWER),  # 终端层级自动 resolved=True
             resolution_note=data.get("resolution_note", ""),
         )
 
     @staticmethod
     def _is_show_answer_request(user_response: str) -> bool:
-        """Detect whether the student is explicitly asking for the answer."""
+        """检测学生是否明确要求直接显示答案。（安全阀1 — Python 关键词匹配）
+
+        触发词列表（15 个中英文关键词）：
+        - 中文: "显示答案", "告诉我答案", "直接说答案", "公布答案",
+                 "看答案", "给答案", "答案是什么", "正确答案是什么",
+                 "我不会", "完全不会", "太难了", "想不出来"
+        - 英文: "show answer", "tell me the answer", "give me the answer"
+
+        Args:
+            user_response: 学生的输入文本。
+
+        Returns:
+            bool: 匹配到任何触发词返回 True。
+        """
         triggers = [
             "显示答案", "告诉我答案", "直接说答案", "公布答案",
             "看答案", "给答案", "答案是什么", "正确答案是什么",
@@ -405,11 +457,19 @@ class SocraticEngine:
         self,
         history: list[dict[str, Any]],
     ) -> SocraticTurn:
-        """Build a SHOW_ANSWER turn directly (no LLM needed for detection).
+        """构建 SHOW_ANSWER 轮次（安全阀1的快速路径）。
 
-        This is a fast path — the LLM is still called once to produce
-        a quality answer explanation.  But we set the level to
-        SHOW_ANSWER so the LLM knows it should provide the full answer.
+        不调用 LLM，直接返回一则"软确认"消息。
+        学生必须再次输入"显示答案"才会真正进入 LLM 生成的完整解析。
+
+        这种"二次确认"设计防止学生误触"显示答案"按钮后
+        直接看到答案，给予最后一次思考机会。
+
+        Args:
+            history: 对话历史（用于提取上下文 ID）。
+
+        Returns:
+            SocraticTurn: level=SHOW_ANSWER 但 resolved=False 的软确认轮。
         """
         first = history[0]
         kp_id = first.get("kp_id", "")
@@ -418,9 +478,6 @@ class SocraticEngine:
         logger.info(
             "User requested answer explicitly — switching to SHOW_ANSWER"
         )
-        # We return a placeholder and let the caller re-enter via the
-        # normal continue_dialogue path, but we can just short-circuit
-        # here.
         return SocraticTurn(
             turn_id=str(uuid4()),
             kp_id=kp_id,
@@ -434,7 +491,7 @@ class SocraticEngine:
             ),
             expected_concepts=[],
             reasoning="学生请求显示答案，先进行一轮软确认",
-            resolved=False,
+            resolved=False,  # 注意：不是终端状态，学生还可以继续
             resolution_note="",
         )
 
@@ -443,10 +500,17 @@ class SocraticEngine:
         history: list[dict[str, Any]],
         user_response: str,
     ) -> SocraticTurn:
-        """Force a SHOW_ANSWER when max turns exceeded.
+        """达到最大轮数后强制显示答案。（安全阀2 — 轮数限制）
 
-        Calls the LLM with an explicit instruction to provide the full
-        answer and explanation.
+        调用 LLM 时附加"已达到最大对话轮数"的指示，
+        LLM 将以 SHOW_ANSWER 层级给出完整解析。
+
+        Args:
+            history: 对话历史。
+            user_response: 学生本轮输入。
+
+        Returns:
+            SocraticTurn: level=SHOW_ANSWER 的完整解析。
         """
         first = history[0]
         kp_id = first.get("kp_id", "")
@@ -463,18 +527,18 @@ class SocraticEngine:
 
 
 # ===================================================================
-# Module-level helpers
+# 模块级工具函数
 # ===================================================================
 
 
 def _strip_markdown_fence(raw: str) -> str:
-    """Remove Markdown code fences from an LLM response if present."""
+    """去除 LLM 响应中的 Markdown 代码围栏（```json ... ```）。"""
     raw = raw.strip()
     if raw.startswith("```"):
         lines = raw.split("\n")
         if lines[0].startswith("```"):
-            lines = lines[1:]
+            lines = lines[1:]       # 去掉开始的 ```json
         if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
+            lines = lines[:-1]      # 去掉结束的 ```
         raw = "\n".join(lines)
     return raw

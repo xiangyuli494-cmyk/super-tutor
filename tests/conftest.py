@@ -1,7 +1,17 @@
-"""Pytest fixtures for the Super Tutor test suite.
+"""Pytest fixtures and shared helpers for the Super Tutor test suite.
 
-Provides an isolated test database and shared helpers.  Each test file
-defines its own lightweight fake LLM client as needed.
+【功能说明】
+提供测试基础设施：
+1. test_db_path — 临时数据库文件路径（基于 tmp_path fixture）
+2. test_db      — 隔离的测试数据库实例（自动创建表 + 自动清理）
+3. _create_test_material — 插入最小化学习材料记录的辅助函数
+4. _insert_test_kp       — 插入最小化知识点记录的辅助函数
+
+【耦合关系】
+- 被所有 test_*.py 测试文件依赖（通过 pytest fixture 注入）
+- 依赖 super_tutor.core.database.Database（核心基础设施）
+- 不依赖 engine/ 和 models/（轻量级 fixture 层）
+- 测试异步模式：pytest-asyncio（asyncio_mode = auto）
 """
 
 from __future__ import annotations
