@@ -73,7 +73,7 @@ from uuid import uuid4
 import streamlit as st
 
 # ---------------------------------------------------------------------------
-# Ensure the project root is on sys.path (for `streamlit run app.py`)
+# 确保项目根目录在 sys.path 上（用于 streamlit run app.py）
 # ---------------------------------------------------------------------------
 _PROJECT_ROOT = Path(__file__).resolve().parent
 if str(_PROJECT_ROOT) not in sys.path:
@@ -94,7 +94,7 @@ from super_tutor.models.quiz import Question, QuizAttempt
 from super_tutor.models.socratic import build_history_entry
 
 # ---------------------------------------------------------------------------
-# Logging
+# 日志
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -104,7 +104,7 @@ logging.basicConfig(
 logger = logging.getLogger("super_tutor.app")
 
 # ---------------------------------------------------------------------------
-# Constants
+# 常量
 # ---------------------------------------------------------------------------
 COURSE_TYPES = [
     "physics",
@@ -120,7 +120,7 @@ COURSE_TYPES = [
 ]
 
 # ---------------------------------------------------------------------------
-# Session state keys
+# Session state 键名
 # ---------------------------------------------------------------------------
 _S_DB = "tutor_db"
 _S_LLM = "tutor_llm"
@@ -146,19 +146,19 @@ _S_SOCRATIC_TURN = "tutor_socratic_turn"
 
 
 # ===================================================================
-# Service initialisation
+# 服务初始化
 # ===================================================================
 
 
 def _init_services() -> tuple[Database, LLMClient | None, KnowledgeEngine | None]:
-    """Initialise config, database, LLM client, and KnowledgeEngine.
+    """初始化配置、数据库、LLM 客户端和 KnowledgeEngine。
 
-    Returns (db, llm_client, engine).  llm_client and engine may be None
-    if the API key is not configured.
+    返回 (db, llm_client, engine)。如果 API key 未配置，
+    llm_client 和 engine 可能为 None。
     """
     config = TutorConfig.load()
 
-    # -- Database -----------------------------------------------------------
+    # -- 数据库 -----------------------------------------------------------
     db_path = os.getenv("TUTOR_DB_PATH") or str(
         Path.home() / ".super-tutor" / "super_tutor.db"
     )
@@ -167,7 +167,7 @@ def _init_services() -> tuple[Database, LLMClient | None, KnowledgeEngine | None
 
     db = Database(db_path=db_path)
 
-    # -- LLM Client ----------------------------------------------------------
+    # -- LLM 客户端 ----------------------------------------------------------
     llm_client: LLMClient | None = None
     engine: KnowledgeEngine | None = None
 
@@ -175,7 +175,7 @@ def _init_services() -> tuple[Database, LLMClient | None, KnowledgeEngine | None
         logger.warning("API key not configured — LLM features disabled.")
         return db, None, None
 
-    # Sync config to env vars so LLMClient (which reads env vars) can find them
+    # 同步配置到环境变量，使 LLMClient（从环境变量读取）能找到它们
     os.environ.setdefault("TUTOR_API_KEY", config.api_key)
     os.environ.setdefault("TUTOR_API_BASE_URL", config.api_base_url)
     os.environ.setdefault("TUTOR_MODEL", config.model)
@@ -192,18 +192,18 @@ def _init_services() -> tuple[Database, LLMClient | None, KnowledgeEngine | None
 
 
 # ===================================================================
-# PDF text extraction
+# PDF 文本提取
 # ===================================================================
 
 
 def _extract_pdf_text(file_bytes: bytes) -> str:
-    """Extract text from PDF bytes using PyPDF2.
+    """使用 PyPDF2 从 PDF 字节中提取文本。
 
-    Returns the concatenated text of all pages.
+    返回所有页面的拼接文本。
 
     Raises:
-        ImportError: If PyPDF2 is not installed.
-        ValueError: If the PDF cannot be read.
+        ImportError: 未安装 PyPDF2。
+        ValueError: PDF 无法读取。
     """
     try:
         from PyPDF2 import PdfReader
@@ -235,22 +235,22 @@ def _extract_pdf_text(file_bytes: bytes) -> str:
 
 
 # ===================================================================
-# Async runner
+# 异步运行器
 # ===================================================================
 
 
 def _run_async(coro):
-    """Run an async coroutine in a Streamlit-friendly way.
+    """以兼容 Streamlit 的方式运行异步协程。
 
-    Uses ``asyncio.run()`` with a nested-event-loop workaround for
-    environments where an event loop is already running.
+    使用 asyncio.run()，对于已有事件循环的环境，
+    通过嵌套事件循环方案解决。
     """
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(coro)
 
-    # Already inside an event loop — use nest_asyncio if available
+    # 已在事件循环内部 — 尝试使用 nest_asyncio
     try:
         import nest_asyncio
 
@@ -263,12 +263,12 @@ def _run_async(coro):
 
 
 # ===================================================================
-# UI Components
+# UI 组件
 # ===================================================================
 
 
 def _render_api_key_warning() -> None:
-    """Show a warning banner when no API key is configured."""
+    """当未配置 API key 时显示警告横幅。"""
     st.warning(
         "⚠️ **未配置 API Key** — 知识点解析功能不可用。\n\n"
         "请在 `~/.super-tutor/settings.json` 中设置 `api_key`，"
@@ -277,14 +277,14 @@ def _render_api_key_warning() -> None:
 
 
 def _render_knowledge_table(kps: list) -> None:
-    """Render knowledge points as a styled dataframe."""
+    """将知识点渲染为带样式的数据表格。"""
     if not kps:
         st.info("未提取到任何知识点。")
         return
 
     st.subheader(f"📋 知识点列表（共 {len(kps)} 个）")
 
-    # Build display rows
+    # 构建展示行
     rows: list[dict] = []
     for i, kp in enumerate(kps):
         prereq_topics = _resolve_prereq_topics(kp, kps)
@@ -302,7 +302,7 @@ def _render_knowledge_table(kps: list) -> None:
             }
         )
 
-    # Render with coloured difficulty pills via column_config
+    # 通过 column_config 渲染带颜色的难度标签
     st.dataframe(
         rows,
         use_container_width=True,
@@ -320,7 +320,7 @@ def _render_knowledge_table(kps: list) -> None:
 
 
 def _resolve_prereq_topics(kp, all_kps: list) -> str:
-    """Map prerequisite_ids → topic names for display."""
+    """将 prerequisite_ids 映射为主题名称用于展示。"""
     id_to_title: dict[str, str] = {k.kp_id: k.title for k in all_kps}
     names = [
         id_to_title.get(pid, pid[:8] + "…")
@@ -330,7 +330,7 @@ def _resolve_prereq_topics(kp, all_kps: list) -> str:
 
 
 def _resolve_successor_topics(kp, all_kps: list) -> str:
-    """Map successor_ids → title names for display."""
+    """将 successor_ids 映射为主题名称用于展示。"""
     id_to_title: dict[str, str] = {k.kp_id: k.title for k in all_kps}
     names = [
         id_to_title.get(sid, sid[:8] + "…")
@@ -340,7 +340,7 @@ def _resolve_successor_topics(kp, all_kps: list) -> str:
 
 
 # ===================================================================
-# Main page
+# 主页面
 # ===================================================================
 
 
@@ -375,7 +375,7 @@ def main() -> None:
 
     st.divider()
 
-    # -- Lazy-init services ------------------------------------------------
+    # -- 惰性初始化服务 ------------------------------------------------
     if _S_DB not in st.session_state:
         with st.spinner("正在初始化服务…"):
             db, llm, engine = _init_services()
@@ -391,7 +391,7 @@ def main() -> None:
     if llm is None:
         _render_api_key_warning()
 
-    # -- Input section -----------------------------------------------------
+    # -- 输入区域 -----------------------------------------------------
     st.subheader("📥 导入教材")
 
     tab_pdf, tab_text = st.tabs(["📄 上传 PDF", "✏️ 粘贴文本"])
@@ -415,7 +415,7 @@ def main() -> None:
             placeholder="在此粘贴教材内容…\n\n支持 Markdown 格式。",
         )
 
-    # -- Options -----------------------------------------------------------
+    # -- 选项 -----------------------------------------------------------
     col1, col2 = st.columns(2)
     with col1:
         course_type = st.selectbox(
@@ -432,7 +432,7 @@ def main() -> None:
 
     st.divider()
 
-    # -- Parse button ------------------------------------------------------
+    # -- 解析按钮 ------------------------------------------------------
     parse_disabled = (engine is None) or (not pdf_file and not text_input.strip())
 
     if st.button("🔍 开始解析", type="primary", disabled=parse_disabled):
@@ -445,7 +445,7 @@ def main() -> None:
             material_title=material_title,
         )
 
-    # -- Results section ---------------------------------------------------
+    # -- 结果展示 ---------------------------------------------------
     if _S_KPS in st.session_state:
         st.divider()
         kps = st.session_state[_S_KPS]
@@ -466,11 +466,11 @@ def main() -> None:
                 _clear_results()
                 st.rerun()
 
-    # -- Quiz section ------------------------------------------------------
+    # -- 答题区域 ------------------------------------------------------
     if st.session_state.get(_S_QUIZ_MODE) and _S_KPS in st.session_state:
         st.divider()
 
-        # ---- Tab: Quiz / Wrong Book -------------------------------------
+        # ---- 标签页：练习答题 / 错题本 -------------------------------------
         tab_quiz, tab_wrong, tab_assessment, tab_plan = st.tabs(
             ["📝 练习答题", "📖 错题本", "🔬 诊断评估", "📅 学习计划"]
         )
@@ -478,19 +478,19 @@ def main() -> None:
         kps = st.session_state[_S_KPS]
         engine = st.session_state.get(_S_ENGINE)
 
-        # ---- Lazy-init QuizEngine (shared) ------------------------------
+        # ---- 惰性初始化 QuizEngine（共享） ------------------------------
         if _S_QUIZ_ENGINE not in st.session_state:
             st.session_state[_S_QUIZ_ENGINE] = _init_quiz_engine()
         quiz_engine: QuizEngine | None = st.session_state[_S_QUIZ_ENGINE]
 
         # =================================================================
-        # Tab: Quiz
+        # 标签页：练习答题
         # =================================================================
         with tab_quiz:
             if quiz_engine is None:
                 st.warning("⚠️ QuizEngine 不可用 — 请检查 LLM 配置。")
             else:
-                # ---- KP selector -----------------------------------------
+                # ---- 知识点选择器 -----------------------------------------
                 kp_options: dict[str, str] = {
                     kp.kp_id: f"{kp.title} ({kp.difficulty})"
                     for kp in kps
@@ -508,7 +508,7 @@ def main() -> None:
                     help="可多选，题目将均匀分布在所选知识点上。",
                 )
 
-                # ---- Quiz options ----------------------------------------
+                # ---- 出题选项 ----------------------------------------
                 col_count, col_diff, col_types = st.columns(3)
                 with col_count:
                     question_count = st.slider(
@@ -532,7 +532,7 @@ def main() -> None:
                     if not selected_types:
                         selected_types = None
 
-                # ---- Generate button -------------------------------------
+                # ---- 生成按钮 -------------------------------------
                 if st.button(
                     "🎲 生成题目",
                     type="primary",
@@ -548,7 +548,7 @@ def main() -> None:
                     )
                     st.rerun()
 
-            # ---- Render questions ----------------------------------------
+            # ---- 渲染题目 ----------------------------------------
             questions: list[Question] | None = st.session_state.get(_S_QUESTIONS)
 
             if questions:
@@ -573,7 +573,7 @@ def main() -> None:
                     if answer is None or answer == "" or answer == {}:
                         all_answered = False
 
-                # ---- Submit button ---------------------------------------
+                # ---- 提交按钮 ---------------------------------------
                 st.markdown("---")
                 submitted = st.session_state.get(_S_QUIZ_SUBMITTED, False)
 
@@ -593,7 +593,7 @@ def main() -> None:
                     if not all_answered:
                         st.caption("⚠️ 请完成所有题目后再提交。")
 
-                # ---- Results ---------------------------------------------
+                # ---- 结果展示 ---------------------------------------------
                 attempts: list[QuizAttempt] | None = st.session_state.get(
                     _S_ATTEMPTS
                 )
@@ -606,24 +606,24 @@ def main() -> None:
                         st.rerun()
 
         # =================================================================
-        # Tab: Wrong Book
+        # 标签页：错题本
         # =================================================================
         with tab_wrong:
             _render_wrong_book(db=db, kps=kps)
 
         # =================================================================
-        # Tab: Diagnostic Assessment
+        # 标签页：诊断评估
         # =================================================================
         with tab_assessment:
             _render_assessment_tab(kps=kps)
 
         # =================================================================
-        # Tab: Study Plan
+        # 标签页：学习计划
         # =================================================================
         with tab_plan:
             _render_plan_tab(kps=kps)
 
-    # -- Error display -----------------------------------------------------
+    # -- 错误展示 -----------------------------------------------------
     if _S_PARSE_ERROR in st.session_state:
         st.error(st.session_state[_S_PARSE_ERROR])
         if st.button("❌ 清除错误"):
@@ -632,7 +632,7 @@ def main() -> None:
 
 
 # ===================================================================
-# Parse logic
+# 解析逻辑
 # ===================================================================
 
 
@@ -644,8 +644,8 @@ def _do_parse(
     course_type: str,
     material_title: str,
 ) -> None:
-    """Execute the full parse pipeline: extract → persist material → parse KPs."""
-    # -- Determine content source ------------------------------------------
+    """执行完整的解析流程：提取文本 → 持久化教材 → 解析知识点。"""
+    # -- 确定内容来源 ------------------------------------------
     try:
         if pdf_file is not None:
             with st.spinner("📖 正在从 PDF 提取文本…"):
@@ -664,7 +664,7 @@ def _do_parse(
 
     st.info(f"📊 已提取 **{len(content):,}** 字符（来源: {source_label}）")
 
-    # -- Persist material --------------------------------------------------
+    # -- 持久化教材 --------------------------------------------------
     now = datetime.now(timezone.utc).isoformat()
     material_id = str(uuid4())
     title = material_title.strip() or source_label
@@ -684,7 +684,7 @@ def _do_parse(
     )
     logger.info("Material %s created: %s", material_id, title)
 
-    # -- Parse knowledge points --------------------------------------------
+    # -- 解析知识点 --------------------------------------------
     with st.spinner("🤖 AI 正在提取知识点…"):
         try:
             kps = _run_async(
@@ -705,14 +705,14 @@ def _do_parse(
             )
             st.rerun()
 
-    # -- Mark material ready -----------------------------------------------
+    # -- 标记教材就绪 -----------------------------------------------
     _run_async(
         db.update_material(
             material_id, {"status": "ready", "updated_at": datetime.now(timezone.utc).isoformat()}
         )
     )
 
-    # -- Store results -----------------------------------------------------
+    # -- 存储结果 -----------------------------------------------------
     _clear_results()
     st.session_state[_S_KPS] = kps
     st.session_state[_S_MATERIAL_ID] = material_id
@@ -724,7 +724,7 @@ def _do_parse(
 
 
 def _clear_results() -> None:
-    """Remove cached parse results from session state."""
+    """从 session state 中移除缓存的解析结果。"""
     st.session_state.pop(_S_KPS, None)
     st.session_state.pop(_S_MATERIAL_ID, None)
     st.session_state.pop(_S_PARSE_ERROR, None)
@@ -743,12 +743,12 @@ def _clear_results() -> None:
 
 
 # ===================================================================
-# Quiz engine lazy-init
+# Quiz 引擎惰性初始化
 # ===================================================================
 
 
 def _init_quiz_engine() -> QuizEngine | None:
-    """Initialize QuizEngine, reusing existing DB, LLM and KnowledgeEngine."""
+    """初始化 QuizEngine，复用已有的 DB、LLM 和 KnowledgeEngine。"""
     db: Database | None = st.session_state.get(_S_DB)
     llm: LLMClient | None = st.session_state.get(_S_LLM)
     engine: KnowledgeEngine | None = st.session_state.get(_S_ENGINE)
@@ -764,7 +764,7 @@ def _init_quiz_engine() -> QuizEngine | None:
 
 
 def _init_assessment_engine() -> AssessmentEngine | None:
-    """Initialize AssessmentEngine, reusing existing DB, LLM, KnowledgeEngine and QuizEngine."""
+    """初始化 AssessmentEngine，复用已有的 DB、LLM、KnowledgeEngine 和 QuizEngine。"""
     db: Database | None = st.session_state.get(_S_DB)
     llm: LLMClient | None = st.session_state.get(_S_LLM)
     knowledge_engine: KnowledgeEngine | None = st.session_state.get(_S_ENGINE)
@@ -773,7 +773,7 @@ def _init_assessment_engine() -> AssessmentEngine | None:
     if not db or not llm or not knowledge_engine:
         return None
 
-    # Ensure QuizEngine is initialized (AssessmentEngine needs it for grading)
+    # 确保 QuizEngine 已初始化（AssessmentEngine 批改需要它）
     if quiz_engine is None:
         quiz_engine = _init_quiz_engine()
         if quiz_engine is not None:
@@ -795,7 +795,7 @@ def _init_assessment_engine() -> AssessmentEngine | None:
 
 
 def _init_socratic_engine() -> SocraticEngine | None:
-    """Initialize SocraticEngine, reusing existing DB and LLM client."""
+    """初始化 SocraticEngine，复用已有的 DB 和 LLM 客户端。"""
     db: Database | None = st.session_state.get(_S_DB)
     llm: LLMClient | None = st.session_state.get(_S_LLM)
 
@@ -810,15 +810,15 @@ def _init_socratic_engine() -> SocraticEngine | None:
 
 
 # ===================================================================
-# Question renderer (dispatches by type)
+# 题目渲染器（按题型分发）
 # ===================================================================
 
 
 def _render_question(question: Question, index: int, prefix: str = "quiz"):
-    """Render a single question and return the student's answer.
+    """渲染单道题目并返回学生的答案。
 
-    Dispatches to the appropriate Streamlit widget based on question type.
-    Returns ``None`` when the student has not yet provided an answer.
+    根据题目类型分发到对应的 Streamlit 控件。
+    当学生尚未作答时返回 None。
     """
     stem_md = f"**Q{index + 1}.** {question.stem}"
     q_type = (
@@ -827,7 +827,7 @@ def _render_question(question: Question, index: int, prefix: str = "quiz"):
         else str(question.type)
     )
 
-    # -- Metadata pills -------------------------------------------------------
+    # -- 元数据标签 -------------------------------------------------------
     meta_parts: list[str] = []
     if question.difficulty:
         diff_val = (
@@ -843,7 +843,7 @@ def _render_question(question: Question, index: int, prefix: str = "quiz"):
     if meta_parts:
         st.caption("  ".join(meta_parts))
 
-    # -- Dispatch by type -----------------------------------------------------
+    # -- 按题型分发 -----------------------------------------------------
 
     if q_type == "multiple_choice":
         options = question.options or []
@@ -880,7 +880,7 @@ def _render_question(question: Question, index: int, prefix: str = "quiz"):
 
 
 # ===================================================================
-# Quiz generation
+# 题目生成
 # ===================================================================
 
 
@@ -891,7 +891,7 @@ def _do_generate_quiz(
     difficulty: str | None,
     types: list[str] | None,
 ) -> None:
-    """Call QuizEngine.generate_questions() and store results in session."""
+    """调用 QuizEngine.generate_questions() 并将结果存入 session。"""
     with st.spinner(f"🤖 正在生成 {count} 道题目…"):
         try:
             questions = _run_async(
@@ -913,7 +913,7 @@ def _do_generate_quiz(
 
 
 # ===================================================================
-# Quiz grading
+# 题目批改
 # ===================================================================
 
 
@@ -922,12 +922,12 @@ def _do_grade_quiz(
     questions: list[Question],
     student_answers: list[dict],
 ) -> None:
-    """Grade answers, store attempts, and add wrong answers to wrong book."""
+    """批改答案、存储作答记录，并将错题加入错题本。"""
     if not student_answers:
         st.warning("请至少回答一道题目。")
         return
 
-    # -- Grade ----------------------------------------------------------------
+    # -- 批改 ----------------------------------------------------------------
     with st.spinner("🔍 正在批改…"):
         try:
             attempts = _run_async(
@@ -941,15 +941,15 @@ def _do_grade_quiz(
             st.error(f"批改失败: {exc}")
             return
 
-        # -- Persist wrong answers --------------------------------------------
+        # -- 持久化错题 --------------------------------------------
         q_map: dict[str, Question] = {q.question_id: q for q in questions}
         wrong_attempts = [a for a in attempts if a.is_correct is False]
 
         async def _batch_add_wrong_book():
-            """Batch-persist all wrong attempts to the wrong-question book.
+            """将所有错误作答批量持久化到错题本。
 
-            Returns the count of successfully added entries.
-            Failed entries are logged but do not block the batch.
+            返回成功添加的条目数量。
+            失败的条目会记录日志但不会阻断批量操作。
             """
             count = 0
             for attempt in wrong_attempts:
@@ -987,12 +987,12 @@ def _do_grade_quiz(
 
 
 # ===================================================================
-# Quiz results display
+# 答题结果展示
 # ===================================================================
 
 
 def _render_quiz_results(attempts: list[QuizAttempt], questions: list[Question]) -> None:
-    """Display grading results with per-question feedback."""
+    """展示批改结果，包含每道题的反馈。"""
     q_map: dict[str, Question] = {q.question_id: q for q in questions}
     correct = sum(1 for a in attempts if a.is_correct)
     total = len(attempts)
@@ -1042,12 +1042,12 @@ def _render_quiz_results(attempts: list[QuizAttempt], questions: list[Question])
 
 
 # ===================================================================
-# Assessment — diagnostic assessment helpers
+# 诊断评估辅助函数
 # ===================================================================
 
 
 def _do_assessment_generate(assessment_engine: AssessmentEngine, kps: list) -> None:
-    """Generate diagnostic assessment questions for all knowledge points."""
+    """为所有知识点生成诊断性评估题目。"""
     kp_ids = [kp.kp_id for kp in kps]
     if not kp_ids:
         st.warning("没有可用的知识点。")
@@ -1084,7 +1084,7 @@ def _do_assessment_grade(
     student_answers: list[dict],
     kps: list,
 ) -> None:
-    """Grade assessment answers and produce a mastery report."""
+    """批改评估答案并生成掌握度报告。"""
     if not student_answers:
         st.warning("请至少回答一道题目。")
         return
@@ -1115,15 +1115,15 @@ def _do_assessment_grade(
 
 
 def _render_assessment_report(report: AssessmentReport, kps: list) -> None:
-    """Render the diagnostic assessment report.
+    """渲染诊断评估报告。
 
-    Displays overall stats, weak/strong KP lists, recommended learning order,
-    and a placeholder button for generating a study plan.
+    展示总体统计、薄弱/强项知识点列表、建议学习顺序，
+    以及生成学习计划的按钮。
     """
     st.divider()
     st.subheader("🔬 诊断评估报告")
 
-    # ---- Overall stats -------------------------------------------------
+    # ---- 总体统计 -------------------------------------------------
     col_stat1, col_stat2, col_stat3 = st.columns(3)
     with col_stat1:
         pct = report.accuracy
@@ -1144,12 +1144,12 @@ def _render_assessment_report(report: AssessmentReport, kps: list) -> None:
             f"🔍{dist['need_review']} 🔴{dist['need_relearn']}",
         )
 
-    # ---- Report-level warnings ------------------------------------------
+    # ---- 报告级别警告 ------------------------------------------
     if report.warnings:
         for w in report.warnings:
             st.warning(w)
 
-    # ---- Weak KPs -------------------------------------------------------
+    # ---- 薄弱知识点 -------------------------------------------------------
     st.markdown("---")
     if report.weak_kps:
         st.markdown("### ⚠️ 薄弱知识点")
@@ -1170,7 +1170,7 @@ def _render_assessment_report(report: AssessmentReport, kps: list) -> None:
     else:
         st.success("🎉 没有薄弱知识点！所有知识点掌握度均 > 0.5。")
 
-    # ---- Strong KPs -----------------------------------------------------
+    # ---- 强项知识点 -----------------------------------------------------
     st.markdown("---")
     if report.strong_kps:
         st.markdown("### ⭐ 强项知识点")
@@ -1185,12 +1185,12 @@ def _render_assessment_report(report: AssessmentReport, kps: list) -> None:
     else:
         st.info("还没有强项知识点 — 继续加油！")
 
-    # ---- Recommended learning order -------------------------------------
+    # ---- 建议学习顺序 -------------------------------------
     st.markdown("---")
     st.markdown("### 📋 建议学习顺序")
     st.caption("按知识点依赖关系（拓扑排序），从基础到高级排列。")
 
-    # Build KP title lookup
+    # 构建知识点标题查找表
     kp_map: dict[str, Any] = {}
     for kp in kps:
         kp_map[kp.kp_id] = kp
@@ -1237,14 +1237,14 @@ def _render_assessment_report(report: AssessmentReport, kps: list) -> None:
             }.get(r.status, r.status)
             st.caption(status_label)
 
-    # ---- Rules applied --------------------------------------------------
+    # ---- 前置规则校准 --------------------------------------------------
     if report.rules_applied:
         st.markdown("---")
         with st.expander(f"🔧 前置规则校准详情（{len(report.rules_applied)} 条）"):
             for rule_msg in report.rules_applied:
                 st.caption(f"• {rule_msg}")
 
-    # ---- Generate study plan button -------------------------------------
+    # ---- 生成学习计划按钮 -------------------------------------
     st.markdown("---")
     plan_already_generated = _S_PLAN in st.session_state
     col_plan, col_retry = st.columns(2)
@@ -1271,20 +1271,20 @@ def _render_assessment_report(report: AssessmentReport, kps: list) -> None:
 
 
 # ===================================================================
-# Assessment tab renderer
+# 诊断评估标签页渲染
 # ===================================================================
 
 
 def _render_assessment_tab(kps: list) -> None:
-    """Render the diagnostic assessment tab.
+    """渲染诊断评估标签页。
 
-    Flow:
-    1. Lazy-init AssessmentEngine
-    2. Show "开始诊断" button → generate assessment questions
-    3. Render questions → collect answers → "提交评估"
-    4. Show AssessmentReport
+    流程：
+    1. 惰性初始化 AssessmentEngine
+    2. 显示"开始诊断"按钮 → 生成评估题目
+    3. 渲染题目 → 收集答案 → "提交评估"
+    4. 展示 AssessmentReport
     """
-    # ---- Lazy-init AssessmentEngine ------------------------------------
+    # ---- 惰性初始化 AssessmentEngine ------------------------------------
     if _S_ASSESSMENT_ENGINE not in st.session_state:
         st.session_state[_S_ASSESSMENT_ENGINE] = _init_assessment_engine()
     assessment_engine: AssessmentEngine | None = st.session_state[_S_ASSESSMENT_ENGINE]
@@ -1293,14 +1293,14 @@ def _render_assessment_tab(kps: list) -> None:
         st.warning("⚠️ AssessmentEngine 不可用 — 请检查 LLM 配置。")
         return
 
-    # ---- Get current assessment state ----------------------------------
+    # ---- 获取当前评估状态 ----------------------------------
     questions: list[Question] | None = st.session_state.get(_S_ASSESSMENT_QUESTIONS)
     submitted: bool = st.session_state.get(_S_ASSESSMENT_SUBMITTED, False)
     report: AssessmentReport | None = st.session_state.get(_S_ASSESSMENT_REPORT)
 
     kp_ids = [kp.kp_id for kp in kps]
 
-    # ---- Step 1: Start diagnosis button --------------------------------
+    # ---- 第1步：开始诊断按钮 --------------------------------
     if questions is None:
         st.info(
             "🔬 **诊断性评估** 将对所有知识点生成一套诊断题目，"
@@ -1328,7 +1328,7 @@ def _render_assessment_tab(kps: list) -> None:
             st.rerun()
         return
 
-    # ---- Step 2: Render questions --------------------------------------
+    # ---- 第2步：渲染题目 --------------------------------------
     if not submitted:
         st.caption(
             f"已生成 **{len(questions)}** 道诊断性评估题目 · "
@@ -1351,7 +1351,7 @@ def _render_assessment_tab(kps: list) -> None:
             if answer is None or answer == "" or answer == {}:
                 all_answered = False
 
-        # ---- Submit button ----------------------------------------------
+        # ---- 提交按钮 ----------------------------------------------
         st.markdown("---")
         if st.button(
             "📩 提交评估",
@@ -1370,23 +1370,22 @@ def _render_assessment_tab(kps: list) -> None:
             st.caption("⚠️ 请完成所有题目后再提交。")
         return
 
-    # ---- Step 3: Show report -------------------------------------------
+    # ---- 第3步：展示报告 -------------------------------------------
     if report is not None:
         _render_assessment_report(report, kps)
 
 
 # ===================================================================
-# Plan generation helpers
+# 学习计划生成辅助
 # ===================================================================
 
 
 def _do_generate_plan(report: AssessmentReport) -> None:
-    """Generate a study plan from the assessment report via PlanEngine.
+    """根据评估报告通过 PlanEngine 生成学习计划。
 
-    Builds a mastery map from the report's KP results, then calls
-    PlanEngine.generate() to create a topologically-sorted plan with
-    priority-scored schedule items.  The resulting StudyPlan is stored
-    in session state.
+    从报告的 KP 结果构建掌握度映射，然后调用
+    PlanEngine.generate() 创建拓扑排序的、
+    带有优先级评分的计划项。生成的 StudyPlan 存入 session state。
     """
     db: Database = st.session_state[_S_DB]
 
@@ -1427,10 +1426,10 @@ def _do_generate_plan(report: AssessmentReport) -> None:
 
 
 def _do_start_learning_kp(kp_id: str) -> None:
-    """Generate quiz questions for a single KP and switch to quiz tab.
+    """为单个知识点生成练习题目并切换到答题标签页。
 
-    Called from the learning plan page when the user clicks
-    "开始学习此知识点 →" on a specific KP card.
+    当用户在学习计划页面点击某个知识点卡片上的
+    "开始学习此知识点 →" 时调用。
     """
     quiz_engine: QuizEngine | None = st.session_state.get(_S_QUIZ_ENGINE)
     if quiz_engine is None:
@@ -1458,27 +1457,26 @@ def _do_start_learning_kp(kp_id: str) -> None:
 
 
 # ===================================================================
-# Plan tab renderer
+# 学习计划标签页渲染
 # ===================================================================
 
 
 def _render_plan_tab(kps: list) -> None:
-    """Render the learning plan tab.
+    """渲染学习计划标签页。
 
-    Displays the topologically-sorted knowledge point learning path
-    with mastery progress bars, difficulty tags, and per-KP action
-    buttons.  Knowledge points with mastery < 0.5 are highlighted
-    in red as priority learning items.
+    展示拓扑排序后的知识点学习路径，包含掌握度进度条、
+    难度标签和每个知识点的操作按钮。
+    掌握度 < 0.5 的知识点以红色高亮显示为优先学习项。
 
-    Flow:
-    1. If no plan exists and no report → show instructions.
-    2. If no plan but report exists → show "生成学习计划" button.
-    3. If plan exists → render the full learning path.
+    流程：
+    1. 若无计划且无报告 → 显示说明。
+    2. 若无计划但有报告 → 显示"生成学习计划"按钮。
+    3. 若已有计划 → 渲染完整的学习路径。
     """
     plan: StudyPlan | None = st.session_state.get(_S_PLAN)
     report: AssessmentReport | None = st.session_state.get(_S_ASSESSMENT_REPORT)
 
-    # ---- No plan yet -------------------------------------------------------
+    # ---- 尚无计划 -------------------------------------------------------
     if plan is None:
         if report is None:
             st.info(
@@ -1499,17 +1497,17 @@ def _render_plan_tab(kps: list) -> None:
                 st.rerun()
         return
 
-    # ---- Plan exists — render ---------------------------------------------
-    # Build mastery lookup from report
+    # ---- 已有计划 — 渲染 ---------------------------------------------
+    # 从评估报告构建掌握度查找表
     mastery_map: dict[str, float] = {}
     if report:
         for r in report.kp_results:
             mastery_map[r.kp_id] = r.adjusted_mastery
 
-    # Build KP title/difficulty lookup
+    # 构建知识点标题/难度查找表
     kp_map: dict[str, Any] = {kp.kp_id: kp for kp in kps}
 
-    # Fill in KPs not in current material (fetched from DB)
+    # 补充当前教材中没有的知识点（从数据库获取）
     db: Database = st.session_state[_S_DB]
     for kid in plan.kp_sequence:
         if kid not in kp_map:
@@ -1523,7 +1521,7 @@ def _render_plan_tab(kps: list) -> None:
                     difficulty=kp_row.get("difficulty", "medium"),
                 )
 
-    # ---- Header ------------------------------------------------------------
+    # ---- 头部 ------------------------------------------------------------
     st.subheader(f"📅 {plan.title}")
 
     col1, col2, col3, col4 = st.columns(4)
@@ -1542,7 +1540,7 @@ def _render_plan_tab(kps: list) -> None:
     st.caption(f"创建时间: {plan.created_at[:16].replace('T', ' ')}  |  "
                f"状态: {plan.status}")
 
-    # ---- Learning path -----------------------------------------------------
+    # ---- 学习路径 -----------------------------------------------------
     st.divider()
     st.subheader("📋 学习路径")
     st.caption("按知识点依赖关系拓扑排序，掌握度 < 50% 标记为优先学习。")
@@ -1561,7 +1559,7 @@ def _render_plan_tab(kps: list) -> None:
         mastery = mastery_map.get(kid, 0.0)
         is_priority = mastery < 0.5
 
-        # Find matching schedule item
+        # 查找匹配的排期项
         schedule_item = next(
             (it for it in plan.schedule if it.knowledge_node_id == kid), None
         )
@@ -1569,7 +1567,7 @@ def _render_plan_tab(kps: list) -> None:
         estimated_min = schedule_item.estimated_minutes if schedule_item else 15
         activity_label = activity_labels.get(activity_type, activity_type)
 
-        # ---- KP card -------------------------------------------------------
+        # ---- 知识点卡片 -------------------------------------------------------
         priority_marker = " 🔴" if is_priority else ""
         st.markdown(f"### {i + 1}. {title}{priority_marker}")
 
@@ -1597,7 +1595,7 @@ def _render_plan_tab(kps: list) -> None:
 
         st.divider()
 
-    # ---- Footer actions ----------------------------------------------------
+    # ---- 底部操作 ----------------------------------------------------
     col_regen, col_clear = st.columns(2)
     with col_regen:
         if report and st.button(
@@ -1613,15 +1611,15 @@ def _render_plan_tab(kps: list) -> None:
 
 
 # ===================================================================
-# Socratic dialogue helpers
+# 苏格拉底对话辅助
 # ===================================================================
 
 
 def _do_start_socratic(kp_id: str, wrong_id: str) -> None:
-    """Start a new Socratic dialogue for a wrong question.
+    """为一道错题启动新的苏格拉底对话。
 
-    Initialises the SocraticEngine (lazy), calls ``start_dialogue()``,
-    and stores the initial L1_GUIDING turn in session state.
+    惰性初始化 SocraticEngine，调用 start_dialogue()，
+    并将初始的 L1_GUIDING 轮次存入 session state。
     """
     engine: SocraticEngine | None = st.session_state.get(_S_SOCRATIC_ENGINE)
     if engine is None:
@@ -1631,7 +1629,7 @@ def _do_start_socratic(kp_id: str, wrong_id: str) -> None:
             return
         st.session_state[_S_SOCRATIC_ENGINE] = engine
 
-    # If clicking on a different wrong question, reset first
+    # 如果点击了不同的错题，先重置
     if st.session_state.get(_S_SOCRATIC_ACTIVE) != wrong_id:
         _clear_socratic()
 
@@ -1656,10 +1654,10 @@ def _do_start_socratic(kp_id: str, wrong_id: str) -> None:
 
 
 def _do_continue_socratic(user_response: str) -> None:
-    """Continue an ongoing Socratic dialogue with the student's response.
+    """用学生的回答继续进行中的苏格拉底对话。
 
-    Builds a history entry from the current turn + user response, calls
-    ``continue_dialogue()``, and updates session state with the next turn.
+    从当前轮次和用户回答构建历史记录条目，
+    调用 continue_dialogue()，并用下一轮次更新 session state。
     """
     engine: SocraticEngine | None = st.session_state.get(_S_SOCRATIC_ENGINE)
     turn = st.session_state.get(_S_SOCRATIC_TURN)
@@ -1668,7 +1666,7 @@ def _do_continue_socratic(user_response: str) -> None:
     if engine is None or turn is None:
         return
 
-    # Build history entry from current turn + user response
+    # 从当前轮次和用户回答构建历史记录
     history.append(build_history_entry(turn, user_response))
 
     with st.spinner("🤔 AI 正在思考…"):
@@ -1693,21 +1691,20 @@ def _do_continue_socratic(user_response: str) -> None:
 
 
 def _clear_socratic() -> None:
-    """Clear all Socratic dialogue state from the session."""
+    """从 session 中清除所有苏格拉底对话状态。"""
     st.session_state.pop(_S_SOCRATIC_ACTIVE, None)
     st.session_state.pop(_S_SOCRATIC_TURN, None)
     st.session_state.pop(_S_SOCRATIC_HISTORY, None)
 
 
 def _render_socratic_dialogue(wrong_id: str) -> None:
-    """Render the Socratic dialogue UI for an active wrong question.
+    """为当前活跃的错题渲染苏格拉底对话界面。
 
-    Displays the conversation history (teacher + student messages),
-    the current turn's teacher message, and input controls for the
-    student to respond.  Supports two exit paths:
+    展示对话历史（教师 + 学生消息）、当前轮次的教师消息，
+    以及供学生回答的输入控件。支持两种退出方式：
 
-    * "我知道了 ✅" — the student feels they understand
-    * "显示答案" — the student wants the full answer revealed
+    * "我知道了 ✅" — 学生认为已理解
+    * "显示答案" — 学生希望查看完整答案
     """
     turn = st.session_state.get(_S_SOCRATIC_TURN)
     history: list[dict] = st.session_state.get(_S_SOCRATIC_HISTORY, [])
@@ -1715,7 +1712,7 @@ def _render_socratic_dialogue(wrong_id: str) -> None:
     if turn is None:
         return
 
-    # ---- Level badge ---------------------------------------------------
+    # ---- 层级标签 ---------------------------------------------------
     level_badges = {
         "L1_GUIDING": "🔵 笼统引导",
         "L2_HINTING": "🟡 具体提示",
@@ -1726,18 +1723,18 @@ def _render_socratic_dialogue(wrong_id: str) -> None:
     badge = level_badges.get(turn.level, turn.level)
     st.caption(f"🤔 苏格拉底追问 · 层级: {badge}")
 
-    # ---- Conversation history -------------------------------------------
+    # ---- 对话历史 -------------------------------------------
     for h in history:
         with st.chat_message("assistant"):
             st.markdown(h.get("teacher_message", ""))
         with st.chat_message("user"):
             st.markdown(h.get("user_response", ""))
 
-    # ---- Current turn (teacher message) ---------------------------------
+    # ---- 当前轮次（教师消息）---------------------------------
     with st.chat_message("assistant"):
         st.markdown(turn.teacher_message)
 
-    # ---- Terminal state -------------------------------------------------
+    # ---- 终止状态 -------------------------------------------------
     if turn.is_terminal:
         if turn.resolution_note:
             st.caption(f"💡 {turn.resolution_note}")
@@ -1747,12 +1744,12 @@ def _render_socratic_dialogue(wrong_id: str) -> None:
             st.rerun()
         return
 
-    # ---- Expected concepts hint -----------------------------------------
+    # ---- 期望概念提示 -----------------------------------------
     if turn.expected_concepts:
         with st.expander("🧠 期望涉及的概念（教师参考）"):
             st.caption("、".join(turn.expected_concepts))
 
-    # ---- Student input area ---------------------------------------------
+    # ---- 学生输入区域 ---------------------------------------------
     col_input, col_actions = st.columns([3, 1])
 
     with col_input:
@@ -1786,7 +1783,7 @@ def _render_socratic_dialogue(wrong_id: str) -> None:
             _do_continue_socratic("显示答案")
             st.rerun()
 
-    # ---- Send button for text input -------------------------------------
+    # ---- 文本输入发送按钮 -------------------------------------
     if st.button(
         "📤 发送",
         key=f"socratic_send_{wrong_id}",
@@ -1798,18 +1795,17 @@ def _render_socratic_dialogue(wrong_id: str) -> None:
 
 
 # ===================================================================
-# Wrong book
+# 错题本
 # ===================================================================
 
 
 def _render_wrong_book(db: Database, kps: list) -> None:
-    """Render the wrong-question book with filters, KP grouping, and actions.
+    """渲染错题本，包含筛选器、知识点分组和操作按钮。
 
-    Fetches wrong-question entries from the database, displays them
-    grouped by knowledge point, and provides "redo" and "Socratic
-    follow-up" actions.
+    从数据库获取错题记录，按知识点分组展示，
+    并提供"重新作答"和"苏格拉底追问"操作。
     """
-    # ---- Fetch wrong questions --------------------------------------------
+    # ---- 获取错题 --------------------------------------------
     raw_entries, total = _run_async(
         db.list_wrong_questions_by_student("default", limit=500, offset=0)
     )
@@ -1818,12 +1814,12 @@ def _render_wrong_book(db: Database, kps: list) -> None:
         st.info("🎉 错题本为空 — 还没有答错的题目。")
         return
 
-    # ---- Build KP title lookup --------------------------------------------
+    # ---- 构建知识点标题查找表 --------------------------------------------
     kp_title_map: dict[str, str] = {}
     for kp in kps:
         kp_title_map[kp.kp_id] = kp.title
 
-    # Enrich from DB for KPs not in the current material
+    # 从数据库补充当前教材中没有的知识点
     missing_kp_ids: set[str] = set()
     for entry in raw_entries:
         kid = entry.get("kp_id", "")
@@ -1837,7 +1833,7 @@ def _render_wrong_book(db: Database, kps: list) -> None:
         else:
             kp_title_map[kid] = kid[:8] + "…"
 
-    # ---- Collect all unique KPs for filter --------------------------------
+    # ---- 收集所有唯一知识点用于筛选 --------------------------------
     unique_kp_ids = list(dict.fromkeys(e.get("kp_id", "") for e in raw_entries))
     kp_filter_options: dict[str, str] = {
         "__all__": "全部知识点",
@@ -1847,7 +1843,7 @@ def _render_wrong_book(db: Database, kps: list) -> None:
             title = kp_title_map.get(kid, kid[:8] + "…")
             kp_filter_options[kid] = f"{title}"
 
-    # ---- Filters ----------------------------------------------------------
+    # ---- 筛选器 ----------------------------------------------------------
     col_kp, col_time = st.columns(2)
     with col_kp:
         selected_kp_filter = st.selectbox(
@@ -1867,7 +1863,7 @@ def _render_wrong_book(db: Database, kps: list) -> None:
 
     st.caption(f"共 **{total}** 条错题记录")
 
-    # ---- Apply filters ----------------------------------------------------
+    # ---- 应用筛选 ----------------------------------------------------
     now_utc = datetime.now(timezone.utc)
     cutoff: str | None = None
     if selected_time_filter == "最近7天":
@@ -1890,8 +1886,8 @@ def _render_wrong_book(db: Database, kps: list) -> None:
         st.info("没有符合筛选条件的错题。")
         return
 
-    # ---- Enhance entries with question data --------------------------------
-    # Batch-fetch questions to avoid N+1 queries
+    # ---- 用题目数据增强条目 --------------------------------
+    # 批量获取题目以避免 N+1 查询
     qid_set: set[str] = {e["question_id"] for e in filtered if e.get("question_id")}
     q_map: dict[str, dict] = {}
     for qid in qid_set:
@@ -1899,16 +1895,16 @@ def _render_wrong_book(db: Database, kps: list) -> None:
         if q_row:
             q_map[qid] = q_row
 
-    # ---- Group by KP ------------------------------------------------------
+    # ---- 按知识点分组 ------------------------------------------------------
     groups: dict[str, list[dict]] = {}
     for entry in filtered:
         kid = entry.get("kp_id", "") or "__unknown__"
         groups.setdefault(kid, []).append(entry)
 
-    # Sort groups by number of wrong questions (desc)
+    # 按错题数量降序排列分组
     sorted_groups = sorted(groups.items(), key=lambda kv: len(kv[1]), reverse=True)
 
-    # ---- Render groups ----------------------------------------------------
+    # ---- 渲染分组 ----------------------------------------------------
     for kid, entries in sorted_groups:
         kp_title = kp_title_map.get(kid, "未知知识点")
         n = len(entries)
@@ -1917,11 +1913,11 @@ def _render_wrong_book(db: Database, kps: list) -> None:
                 qid = entry.get("question_id", "")
                 q_row = q_map.get(qid, {})
 
-                # --- Question stem ------------------------------------------
+                # --- 题目标题 ------------------------------------------
                 stem = q_row.get("stem", "（题目已删除）")
                 st.markdown(f"**Q{idx + 1}.** {stem}")
 
-                # --- Answer comparison --------------------------------------
+                # --- 答案对比 --------------------------------------
                 col_wrong, col_correct = st.columns(2)
                 with col_wrong:
                     st.markdown("❌ **你的答案:**")
@@ -1940,12 +1936,12 @@ def _render_wrong_book(db: Database, kps: list) -> None:
                     except (json.JSONDecodeError, TypeError):
                         st.text(correct_ans)
 
-                # --- Explanation --------------------------------------------
+                # --- 解析 --------------------------------------------
                 explanation = q_row.get("explanation", "")
                 if explanation:
                     st.info(explanation)
 
-                # --- Metadata -----------------------------------------------
+                # --- 元数据 -----------------------------------------------
                 meta_cols = st.columns(4)
                 with meta_cols[0]:
                     st.caption(f"📊 犯错次数: **{entry.get('attempt_count', 1)}**")
@@ -1966,7 +1962,7 @@ def _render_wrong_book(db: Database, kps: list) -> None:
                         f"KP: `{kid[:8]}…`" if kid != "__unknown__" else "KP: —"
                     )
 
-                # --- Actions -------------------------------------------------
+                # --- 操作 -------------------------------------------------
                 wrong_id = entry.get("wrong_id", "")
                 col_redo, col_socratic = st.columns(2)
                 with col_redo:
@@ -2002,7 +1998,7 @@ def _render_wrong_book(db: Database, kps: list) -> None:
                             _do_start_socratic(kp_id=kid, wrong_id=wrong_id)
                         st.rerun()
 
-                # --- Socratic dialogue UI ---------------------------------
+                # --- 苏格拉底对话界面 ---------------------------------
                 if st.session_state.get(_S_SOCRATIC_ACTIVE) == wrong_id:
                     _render_socratic_dialogue(wrong_id)
 
@@ -2010,7 +2006,7 @@ def _render_wrong_book(db: Database, kps: list) -> None:
 
 
 def _do_redo_from_wrong_book(kp_id: str) -> None:
-    """Generate a new quiz for the given KP and switch to quiz tab."""
+    """为指定知识点生成新的练习题目并切换到答题标签页。"""
     quiz_engine: QuizEngine | None = st.session_state.get(_S_QUIZ_ENGINE)
     if quiz_engine is None:
         st.warning("⚠️ QuizEngine 不可用。")
@@ -2037,7 +2033,7 @@ def _do_redo_from_wrong_book(kp_id: str) -> None:
 
 
 # ===================================================================
-# Entry point
+# 入口点
 # ===================================================================
 
 if __name__ == "__main__":
